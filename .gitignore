@@ -1,14 +1,35 @@
 
 # Misc
 outputs/
-checkpoints
-data/*
 apex/
 assets/
 runs
 runs/
 evaluate_results/
 .deepspeed*
+error_logs/
+slurm_jobs/
+*.log
+
+# Checkpoints / model weights (local)
+checkpoints/
+**/checkpoints/
+
+# Datasets / data roots (do not commit local data symlinks or caches)
+# Use leading slash so src/fastwam/datasets (Python package) stays tracked.
+/data
+/data/
+/datasets/
+text_embeds_cache/
+*.parquet
+*.arrow
+*.mp4
+*.avi
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.safetensors
 
 
 # ai coding
@@ -235,6 +256,9 @@ manifest.json
 *.no_exist*
 *models--t5*
 
+# Optional tracked HF release weights under data/ (requires un-ignoring parents)
+!data/
+!data/fastwam_model_hf_release/
 !data/fastwam_model_hf_release/libero_uncond_2cam224.pt
 !data/fastwam_model_hf_release/robotwin_uncond_3cam_384.pt
 

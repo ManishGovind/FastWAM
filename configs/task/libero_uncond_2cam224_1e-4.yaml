@@ -6,8 +6,8 @@ defaults:
   - _self_
 
 # dataloading
-batch_size: 16
-num_workers: 8
+batch_size: 32
+num_workers: 4
 
 model:
   mot_checkpoint_mixed_attn: false
