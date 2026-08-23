@@ -7,7 +7,7 @@ defaults:
 
 # dataloading
 batch_size: 32
-num_workers: 4
+num_workers: 8
 
 model:
   mot_checkpoint_mixed_attn: false
@@ -18,7 +18,7 @@ learning_rate: 1e-4
 num_epochs: 10
 max_steps: null
 log_every: 10
-save_every: 2000
+save_every: 7000
 eval_every: 200
 
 # training
