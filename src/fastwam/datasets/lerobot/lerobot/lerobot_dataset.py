@@ -551,12 +551,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
 
-        # Check timestamps
-        timestamps = torch.stack(self.hf_dataset["timestamp"]).numpy()
-        episode_indices = torch.stack(self.hf_dataset["episode_index"]).numpy()
-        ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
-        # check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
-
         # Setup delta_indices
         if self.delta_timestamps is not None:
             # check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
@@ -737,7 +731,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         for key in video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
-                query_timestamps[key] = torch.stack(timestamps).tolist()
+                query_timestamps[key] = torch.stack(list(timestamps)).tolist()
             else:
                 query_timestamps[key] = [current_ts]
 
@@ -745,7 +739,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
         return {
-            key: torch.stack(self.hf_dataset.select(q_idx)[key])
+            key: torch.stack(list(self.hf_dataset.select(q_idx)[key]))
             for key, q_idx in query_indices.items()
             if key not in self.meta.video_keys
         }
@@ -765,7 +759,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     processed_indices.add(q_idx_tuple)
                 else:
                     selected_data = index_to_selected[q_idx_tuple]
-                result[key] = torch.stack(selected_data[key])
+                result[key] = torch.stack(list(selected_data[key]))
         return result
     
     # no videos
