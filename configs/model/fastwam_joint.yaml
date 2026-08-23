@@ -50,8 +50,8 @@ video_scheduler:
   num_train_timesteps: 1000
 
 action_scheduler:
-  train_shift: 5.0
-  infer_shift: 5.0
+  train_shift: 1.0
+  infer_shift: 1.0
   num_train_timesteps: 1000
 
 loss:
