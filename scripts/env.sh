@@ -11,6 +11,9 @@ export PATH="${ROOT}/.venv/bin:${PATH}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/work/mgovind1/hf_cache/triton}"
 mkdir -p "${TRITON_CACHE_DIR}/autotune"
 
+NPP_LIB="$(find "$PWD/.venv" -name 'libnppicc.so.12' | head -1 | xargs dirname)"
+export LD_LIBRARY_PATH="$PWD/.ffmpeg-env/lib:${NPP_LIB}:${LD_LIBRARY_PATH:-}"
+
 # CUDA toolkit (uv: nvidia-cuda-nvcc). cu12 wheels ship only ptxas; cu13 provides nvcc.
 CUDA_NVCC_HOME="${ROOT}/.venv/lib/python3.10/site-packages/nvidia/cu13"
 if [[ -x "${CUDA_NVCC_HOME}/bin/nvcc" ]]; then

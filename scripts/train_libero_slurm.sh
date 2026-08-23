@@ -36,4 +36,4 @@ if [[ ! -d data/text_embeds_cache/libero ]] || [[ -z "$(ls -A data/text_embeds_c
     task=libero_joint_2cam224_1e-4
 fi
 
-bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
+bash scripts/train_zero1.sh 8 task=libero_uncond_no_cotrain_2cam224_1e-4

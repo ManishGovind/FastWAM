@@ -3,19 +3,19 @@
 #SBATCH --partition=gpu-hp
 #SBATCH --qos=charlotte_h200_hp
 #SBATCH --gres=gpu:h200:8
-#SBATCH --output=./slurm_jobs/%j.out
-#SBATCH --error=./error_logs/%j.err
+#SBATCH --output=./slurm_jobs_RobotWin/%j.out
+#SBATCH --error=./error_logs_RobotWin/%j.err
 #SBATCH --mail-user=mgovind@charlotte.edu
 #SBATCH --mail-type=END,FAIL
 #SBATCH -J fastwam_robotwin
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=192
-#SBATCH --mem=2000G
+#SBATCH --mem=500G
 
 set -euo pipefail
 cd /work/mgovind1/projects/FastWAM
-mkdir -p slurm_jobs error_logs
+mkdir -p slurm_jobs_RobotWin error_logs_RobotWin
 
 # shellcheck disable=SC1091
 source scripts/env.sh
@@ -32,8 +32,8 @@ fi
 # One-time: T5 text embedding cache
 if [[ ! -d data/text_embeds_cache/robotwin ]] || [[ -z "$(ls -A data/text_embeds_cache/robotwin 2>/dev/null || true)" ]]; then
   torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py \
-    task=robotwin_uncond_3cam_384_1e-4
+    task=robotwin_joint_3cam_384_1e-4
 fi
 
 # Paper used 64 GPUs; this single-node 8-GPU job is a starting point.
-bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
+bash scripts/train_zero1.sh 8 task=robotwin_joint_3cam_384_1e-4

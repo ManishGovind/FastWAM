@@ -2,7 +2,7 @@
 #SBATCH -t 2-00:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128G
 #SBATCH -J fastwam_dav2_vitl_flow
 #SBATCH --output=./slurm_jobs/%j.out

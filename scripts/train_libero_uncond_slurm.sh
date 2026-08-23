@@ -2,7 +2,7 @@
 #SBATCH -t 7-00:00:00
 #SBATCH --partition=gpu-hp
 #SBATCH --qos=charlotte_h200_hp
-#SBATCH --gres=gpu:h200:8
+#SBATCH --gres=gpu:h200:4
 #SBATCH --output=./slurm_jobs/%j.out
 #SBATCH --error=./error_logs/%j.err
 #SBATCH --mail-user=mgovind@charlotte.edu
@@ -10,7 +10,8 @@
 #SBATCH -J fastwam_uncond_libero
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=192
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=300G
 
 
 set -euo pipefail
@@ -20,7 +21,7 @@ mkdir -p slurm_jobs error_logs
 # shellcheck disable=SC1091
 source scripts/env.sh
 
-TASK=libero_uncond_2cam224_1e-4
+TASK=libero_uncond_no_cotrain_2cam224_1e-4
 
 # One-time (or if missing): ActionDiT backbone from Wan2.2 DiT
 if [[ ! -f checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt ]]; then
@@ -37,4 +38,4 @@ if [[ ! -d data/text_embeds_cache/libero ]] || [[ -z "$(ls -A data/text_embeds_c
     task="${TASK}"
 fi
 
-bash scripts/train_zero1.sh 8 task="${TASK}"
+bash scripts/train_zero1.sh 4 task="${TASK}"
