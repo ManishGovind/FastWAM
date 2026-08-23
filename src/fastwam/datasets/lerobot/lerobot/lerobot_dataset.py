@@ -80,6 +80,56 @@ import traceback
 CODEBASE_VERSION = "v2.1"
 
 
+def _register_on_disk_video_features(meta: "LeRobotDatasetMetadata", keys: list[str]) -> None:
+    """If requested image keys exist as mp4s but are missing from info.json, register them in memory.
+
+    Depth/flow videos from `scripts/precompute_depth_flow.py` may be on disk before
+    `meta/info.json` is updated. Training still needs them listed as `dtype=video`.
+    """
+    from fastwam.datasets.lerobot.utils.depth_flow_codec import (
+        feature_dict_for_depth,
+        feature_dict_for_flow,
+        is_depth_video_key,
+        is_flow_video_key,
+    )
+
+    existing_video = next((ft for ft in meta.features.values() if ft.get("dtype") == "video"), None)
+    for key in keys:
+        if key in meta.features:
+            continue
+        if not str(key).startswith("observation.images"):
+            continue
+        video_path = meta.root / meta.get_video_file_path(0, key)
+        if not video_path.is_file():
+            raise FileNotFoundError(
+                f"Requested video key '{key}' is not in {meta.root / 'meta' / 'info.json'} "
+                f"and no file exists at {video_path}."
+            )
+        if existing_video is not None:
+            height, width = int(existing_video["shape"][0]), int(existing_video["shape"][1])
+        else:
+            height, width = 512, 512
+        fps = int(meta.fps)
+        if is_depth_video_key(key):
+            feat = feature_dict_for_depth(height, width, fps)
+        elif is_flow_video_key(key):
+            feat = feature_dict_for_flow(height, width, fps)
+        elif existing_video is not None:
+            feat = {
+                "dtype": "video",
+                "shape": list(existing_video["shape"]),
+                "names": existing_video.get("names", ["height", "width", "rgb"]),
+                "info": dict(existing_video.get("info") or {}),
+            }
+        else:
+            raise FileNotFoundError(
+                f"Cannot infer video metadata for '{key}' at {video_path}: no existing video features."
+            )
+        feat["shape"] = tuple(feat["shape"])
+        meta.info["features"][key] = feat
+        logging.info("Registered on-disk video feature '%s' for %s", key, meta.root)
+
+
 class LeRobotDatasetMetadata:
     def __init__(
         self,
@@ -481,6 +531,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta = LeRobotDatasetMetadata(
             self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync
         )
+        if self.delta_timestamps is not None:
+            _register_on_disk_video_features(self.meta, list(self.delta_timestamps.keys()))
         if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
             episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
             self.stats = aggregate_stats(episodes_stats)
@@ -678,7 +730,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
+        if query_indices is not None:
+            video_keys = [key for key in query_indices if key in self.meta.video_keys]
+        else:
+            video_keys = list(self.meta.video_keys)
+        for key in video_keys:
             if query_indices is not None and key in query_indices:
                 timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
                 query_timestamps[key] = torch.stack(timestamps).tolist()

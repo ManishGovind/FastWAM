@@ -69,9 +69,26 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.image_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
-            delta_timestamps[meta["lerobot_key"]] = [
+            image_delta = [
                 (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
             ]
+            delta_timestamps[meta["lerobot_key"]] = image_delta
+            future_key = meta.get("future_key")
+            if future_key:
+                if future_key == key:
+                    raise ValueError(
+                        f"shape_meta.images key '{key}' has future_key equal to itself; "
+                        "future_key must be a different video stream (e.g. depth)."
+                    )
+                meta["future_lerobot_key"] = (
+                    f"observation.images.{future_key}" if future_key != "default" else "observation.images"
+                )
+                delta_timestamps[meta["future_lerobot_key"]] = list(image_delta)
+                logger.info(
+                    "RGB-conditioned depth target: keep frame 0 from '%s', replace later frames with '%s'.",
+                    meta["lerobot_key"],
+                    meta["future_lerobot_key"],
+                )
         
         for meta in self.state_meta:
             key = meta["key"]
@@ -149,6 +166,31 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # For config simplication
         # assert image.shape[1:] == raw_shape, f"Image '{key}' shape {image.shape[1:]} mismatch with {raw_shape}."
         return image
+
+    def _get_image_with_future_target(self, meta, lerobot_sample) -> torch.Tensor:
+        image = self._get_image(meta, lerobot_sample)
+        future_key = meta.get("future_key")
+        if not future_key:
+            return image
+        future_meta = {
+            "key": future_key,
+            "lerobot_key": meta["future_lerobot_key"],
+            "raw_shape": meta["raw_shape"],
+        }
+        future = self._get_image(future_meta, lerobot_sample)
+        if future.shape != image.shape:
+            raise ValueError(
+                f"future_key '{future_key}' shape {tuple(future.shape)} does not match "
+                f"key '{meta['key']}' shape {tuple(image.shape)}."
+            )
+        if image.shape[0] < 2:
+            raise ValueError(
+                f"RGB-conditioned future target requires T>=2, got T={image.shape[0]} "
+                f"for key '{meta['key']}'."
+            )
+        image = image.clone()
+        image[1:] = future[1:]
+        return image
     
     def _split_lerobot_sample(self, lerobot_sample) -> Dict[str, Any]:
         return lerobot_sample
@@ -220,7 +262,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             sample["action"][meta["key"]] = self._get_action(meta, lerobot_sample)
 
         for meta in self.image_meta:
-            sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
+            sample["images"][meta["key"]] = self._get_image_with_future_target(meta, lerobot_sample)
 
         sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
         sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
