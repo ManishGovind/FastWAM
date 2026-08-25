@@ -30,6 +30,8 @@ text_embeds_cache/
 *.npy
 *.npz
 *.safetensors
+*.yaml
+*.yml
 
 volc/
 tests/
