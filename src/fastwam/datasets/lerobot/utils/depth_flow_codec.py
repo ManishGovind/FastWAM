@@ -211,6 +211,18 @@ def uint8_rgb_to_flow(
     return np.stack([u, v], axis=1)
 
 
+def is_depth_video_key(key: str) -> bool:
+    """True for keys like `observation.images.depth` or `wrist_depth`."""
+    name = str(key).rsplit(".", 1)[-1]
+    return "depth" in name
+
+
+def is_flow_video_key(key: str) -> bool:
+    """True for keys like `observation.images.flow` or `wrist_flow`."""
+    name = str(key).rsplit(".", 1)[-1]
+    return "flow" in name
+
+
 def feature_dict_for_depth(height: int, width: int, fps: int, extra_info: dict[str, Any] | None = None) -> dict:
     info = {
         "video.height": int(height),
