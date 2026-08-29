@@ -318,6 +318,18 @@ class Wan22Trainer:
             proprio_encoder.requires_grad_(True)
 
     @staticmethod
+    def _batch_optional_tensor(tensor, *, name: str, batch_ndim: int) -> torch.Tensor:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"`{name}` must be a torch.Tensor, got {type(tensor)}")
+        if tensor.ndim == batch_ndim - 1:
+            return tensor.unsqueeze(0)
+        if tensor.ndim == batch_ndim:
+            return tensor
+        raise ValueError(
+            f"`{name}` must have rank {batch_ndim - 1} or {batch_ndim}, got shape {tuple(tensor.shape)}"
+        )
+
+    @staticmethod
     def _to_batched_eval_sample(sample):
         video = sample["video"]
         prompt = sample["prompt"]
@@ -386,7 +398,7 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
-        return {
+        batched = {
             "video": video,
             "prompt": prompt,
             "action": action,
@@ -395,6 +407,26 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "action_horizon": action_horizon,
         }
+        for key in ("video_rgb", "video_depth", "video_flow"):
+            if key not in sample:
+                continue
+            stream = Wan22Trainer._batch_optional_tensor(
+                sample[key], name=key, batch_ndim=5
+            )
+            if stream.shape[0] != video.shape[0]:
+                raise ValueError(
+                    f"`{key}` batch mismatch: got {stream.shape[0]} vs video batch {video.shape[0]}"
+                )
+            batched[key] = stream
+
+        for key in ("image_is_pad", "action_is_pad"):
+            if key not in sample:
+                continue
+            batched[key] = Wan22Trainer._batch_optional_tensor(
+                sample[key], name=key, batch_ndim=2
+            )
+
+        return batched
 
     @torch.no_grad()
     def evaluate(self):
