@@ -24,6 +24,7 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from experiments.libero.eval_infer import call_action_infer, validate_eval_infer_model
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
     get_libero_dummy_action,
@@ -192,10 +193,13 @@ def _obs_to_model_input(
 ):
     imgs = get_libero_image(obs)
     image_meta = processor.shape_meta["images"]
-    if len(image_meta) < int(processor.num_output_cameras):
+    num_cameras_cfg = int(processor.num_output_cameras)
+    # Multimodal tasks list depth/flow after RGB; LIBERO sim only provides 2 RGB cams.
+    num_cameras = 2 if num_cameras_cfg > 2 else num_cameras_cfg
+    if len(image_meta) < num_cameras:
         raise ValueError(
             f"shape_meta.images has {len(image_meta)} entries, "
-            f"but num_output_cameras={processor.num_output_cameras}."
+            f"but LIBERO eval needs at least {num_cameras} (num_output_cameras={num_cameras_cfg})."
         )
 
     def _meta_to_hw(meta: dict, camera_idx: int) -> tuple[int, int]:
@@ -205,7 +209,6 @@ def _obs_to_model_input(
         return int(shape[1]), int(shape[2])
 
     concatenation = cfg.data.train.get("concat_multi_camera", "horizontal")
-    num_cameras = processor.num_output_cameras
     if num_cameras == 1:
         primary_h, primary_w = _meta_to_hw(image_meta[0], camera_idx=0)
         rgb = _center_crop_resize(imgs["image"], width=primary_w, height=primary_h)
@@ -403,6 +406,9 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    action_attend_mode = cfg.EVALUATION.get("action_attend_mode", None)
+    if action_attend_mode is not None:
+        infer_kwargs["action_attend_mode"] = str(action_attend_mode)
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -431,10 +437,18 @@ def _predict_action_chunk(
             )
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
-            pred = model.infer_action(
-                **infer_kwargs,
+                # pred = model.infer_action(
+                #     **infer_kwargs,
+                #     compile_action_infer=compile_action_infer,
+                # )
+             # call_action_infer: multimodal → multistream infer_action; baselines → model.infer_action
+            pred = call_action_infer(
+                model,
+                infer_kwargs,
                 compile_action_infer=compile_action_infer,
-            )
+                cfg=cfg,
+            )   
+
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -883,6 +897,10 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
+    validate_eval_infer_model(
+        model,
+        action_attend_mode=cfg.EVALUATION.get("action_attend_mode", None),
+    )
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))

@@ -25,7 +25,8 @@ def get_libero_env(task, resolution, seed, env_num=1):
         / task.bddl_file
     )
     env_args = {
-        "bddl_file_name": task_bddl_file,
+        # LIBERO-plus does `"_view_" in bddl_file_name`; Path is not iterable that way.
+        "bddl_file_name": str(task_bddl_file),
         "camera_heights": resolution,
         "camera_widths": resolution,
     }
