@@ -25,6 +25,7 @@ from experiments.libero_plus.libero_plus_utils import (
     bootstrap_libero_plus,
     load_task_init_states,
     lookup_task_classification,
+    plus_policy_instruction,
 )
 
 bootstrap_libero_plus(project_root)
@@ -625,7 +626,11 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
-    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    env, task_description_raw = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    # Same as plus env_wrapper / LIBERO-plus #65: BDDL :language, not filename.
+    task_description = plus_policy_instruction(task, task_description_raw)
+    print(f"task_description_raw: {task_description_raw}")
+    print(f"task_description: {task_description}")
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     save_videos = bool(cfg.EVALUATION.get("save_videos", True))
     results = {
@@ -634,6 +639,8 @@ def run_single_task(
         "success_episodes": [],
         "task_description": task_description,
     }
+    if task_description_raw != task_description:
+        results["task_description_raw"] = task_description_raw
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None

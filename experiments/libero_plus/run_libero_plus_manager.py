@@ -27,6 +27,7 @@ from experiments.libero.worker_pool import pending_task_count, read_worker_statu
 from experiments.libero_plus.libero_plus_utils import (
     bootstrap_libero_plus,
     lookup_task_classification,
+    plus_base_task_name,
     resolve_perturbation_categories,
     worker_env_updates,
 )
@@ -39,12 +40,15 @@ def create_task_file(
     output_file: Path,
     task_suite_names: list[str],
     perturbation_categories: frozenset[str] | None = None,
+    max_tasks_per_category: int | None = None,
 ) -> Path:
     from libero.libero import benchmark
 
     benchmark_dict = benchmark.get_benchmark_dict()
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    cap = max_tasks_per_category
+    counts: dict[tuple, int] = {}
     total_tasks = 0
     skipped = 0
     with output_file.open("w", encoding="utf-8") as f:
@@ -54,30 +58,30 @@ def create_task_file(
             n_tasks = int(task_suite.n_tasks)
             kept = 0
             for task_id in range(n_tasks):
-                if perturbation_categories is not None:
-                    task = task_suite.get_task(task_id)
-                    classification = lookup_task_classification(suite_name, task.name)
-                    category = None if classification is None else classification.get("category")
-                    if category not in perturbation_categories:
-                        skipped += 1
-                        continue
+                task = task_suite.get_task(task_id)
+                classification = lookup_task_classification(suite_name, task.name)
+                category = None if classification is None else classification.get("category")
+                if perturbation_categories is not None and category not in perturbation_categories:
+                    skipped += 1
+                    continue
+                key = (suite_name, category, plus_base_task_name(task.name))
+                if cap is not None and counts.get(key, 0) >= cap:
+                    continue
                 f.write(f"{suite_name},{task_id}\n")
+                counts[key] = counts.get(key, 0) + 1
                 kept += 1
                 total_tasks += 1
             print(f"{suite_name}: {kept}/{n_tasks} tasks")
 
+    print(f"Task list created: {output_file} ({total_tasks} tasks)")
     if perturbation_categories is not None:
-        cats = ", ".join(sorted(perturbation_categories))
-        print(
-            f"Task list created: {output_file} ({total_tasks} tasks, "
-            f"filter=[{cats}], skipped={skipped})"
-        )
-    else:
-        print(f"Task list created: {output_file} ({total_tasks} tasks)")
+        print(f"  filter={sorted(perturbation_categories)} skipped={skipped}")
+    if cap is not None:
+        print(f"  max_tasks_per_category={cap}")
     if total_tasks == 0:
         raise ValueError(
-            "LIBERO-plus task list is empty after applying perturbation_categories. "
-            "Check MULTIRUN.task_suite_names and MULTIRUN.perturbation_categories."
+            "LIBERO-plus task list is empty. Check MULTIRUN.task_suite_names "
+            "and MULTIRUN.perturbation_categories."
         )
     return output_file
 
@@ -355,21 +359,23 @@ def main(cfg: DictConfig):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     categories = resolve_perturbation_categories(manager.get("perturbation_categories"))
-    if categories is not None:
-        print(f"LIBERO-plus perturbation filter: {sorted(categories)}")
+    max_per_cat = manager.get("max_tasks_per_category")
 
     task_file_cfg = manager.get("task_file")
     if task_file_cfg:
         task_file = Path(os.path.expanduser(os.path.expandvars(str(task_file_cfg))))
         if not task_file.exists():
             task_file = create_task_file(
-                task_file, list(manager.task_suite_names), categories
+                task_file, list(manager.task_suite_names), categories, max_per_cat
             )
         else:
             print(f"Using existing task list: {task_file}")
     else:
         task_file = create_task_file(
-            output_dir / "tasks.txt", list(manager.task_suite_names), categories
+            output_dir / "tasks.txt",
+            list(manager.task_suite_names),
+            categories,
+            max_per_cat,
         )
 
     OmegaConf.save(config=cfg, f=str(output_dir / "manager_config.yaml"))

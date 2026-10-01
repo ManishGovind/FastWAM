@@ -29,6 +29,17 @@ LIBERO_PLUS_ROOT_NAME = "LIBERO-plus"
 _LIBERO_PERTURBATION_SUFFIX_RE = re.compile(
     r"_(?:language|view|light)_[^.]*|_(?:table|tb)_\d+"
 )
+_PLUS_BASE_TASK_RE = re.compile(r"_(?:light|table|tb|add|noise)_\d+$")
+
+
+def plus_base_task_name(task_name: str) -> str:
+    """Original LIBERO skill name, with plus suffixes removed."""
+    name = str(task_name)
+    if "_view_" in name:
+        name = name.split("_view_")[0]
+    if "_language_" in name:
+        name = name.split("_language_")[0]
+    return _PLUS_BASE_TASK_RE.sub("", name)
 
 LEADERBOARD_CATEGORIES = [
     ("Camera Viewpoints", "Camera"),
@@ -281,6 +292,61 @@ def load_task_classification(project_root: str | None = None) -> dict[str, dict[
             by_name[str(entry["name"])] = entry
         index[suite_name] = by_name
     return index
+
+
+def resolve_bddl_for_language(task_bddl_file: str | Path) -> Path:
+    """BDDL file whose ``:language`` should be passed to the policy.
+
+    Same remap as plus ``env_wrapper`` and FlexPI (LIBERO-plus #48, #65):
+    Camera / Robot Init / Sensor Noise variants have no own BDDL — they reuse
+    the base file after stripping ``_view_..._initstate_...``. Language
+    variants keep ``..._language_N.bddl`` so the perturbed instruction is used.
+    """
+    path = Path(task_bddl_file)
+    name = path.name
+    if "_view_" in name and "_initstate_" in name:
+        return path.with_name(name.split("_view_")[0] + ".bddl")
+    return path
+
+
+def plus_policy_instruction(task: Any, task_language: str | None = None) -> str:
+    """Instruction the policy should see: BDDL ``:language``, not the filename.
+
+    ``task.language`` is built from the BDDL filename, so Camera tokens like
+    ``view 0 0 184 0 0 initstate 0`` leak into the prompt. The env already
+    loads the remapped BDDL; we read ``:language`` from that same file
+    (LIBERO-plus #65).
+    """
+    from libero.libero import get_libero_path
+
+    fallback = str(task_language if task_language is not None else getattr(task, "language", "")).strip()
+    task_bddl = (
+        Path(get_libero_path("bddl_files"))
+        / task.problem_folder
+        / task.bddl_file
+    )
+    bddl_path = resolve_bddl_for_language(task_bddl)
+    if not bddl_path.exists():
+        return fallback
+    instruction = _language_from_bddl(bddl_path)
+    return instruction or fallback
+
+
+def _language_from_bddl(path: Path) -> str:
+    """Same field ``get_problem_info`` returns, without importing plus envs (wand)."""
+    from bddl.parsing import scan_tokens
+
+    tokens = scan_tokens(filename=str(path))
+    if not (isinstance(tokens, list) and tokens and tokens[0] == "define"):
+        return ""
+    language_instruction: list[str] | str = ""
+    for group in tokens[1:]:
+        if isinstance(group, list) and group and group[0] == ":language":
+            language_instruction = group[1:]
+            break
+    if isinstance(language_instruction, list):
+        return " ".join(str(x) for x in language_instruction)
+    return str(language_instruction).strip()
 
 
 def lookup_task_classification(

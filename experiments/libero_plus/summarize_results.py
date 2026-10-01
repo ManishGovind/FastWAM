@@ -51,6 +51,11 @@ def summarize_results(output_dir, *, ckpt=None, config=None, libero_plus=False):
         'total_trials': 0,
         'total_successes': 0,
     })
+    suite_category_stats = defaultdict(lambda: {
+        'total_tasks': 0,
+        'total_trials': 0,
+        'total_successes': 0,
+    })
     
     # Store detailed per-task results
     task_results = {}
@@ -98,6 +103,10 @@ def summarize_results(output_dir, *, ckpt=None, config=None, libero_plus=False):
                 cat_stats['total_tasks'] += 1
                 cat_stats['total_trials'] += result['total_episodes']
                 cat_stats['total_successes'] += result['successes']
+                cell = suite_category_stats[(suite, category)]
+                cell['total_tasks'] += 1
+                cell['total_trials'] += result['total_episodes']
+                cell['total_successes'] += result['successes']
             
             # Store detailed task results
             task_result = {
@@ -298,6 +307,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None, libero_plus=False):
         )
 
     plus_leaderboard = None
+    plus_suite_perturbations = None
     if libero_plus or has_plus_categories:
         plus_leaderboard = {}
         leaderboard_row = {}
@@ -336,6 +346,63 @@ def summarize_results(output_dir, *, ckpt=None, config=None, libero_plus=False):
         leaderboard_df.to_csv(leaderboard_csv, index=False)
         print(f"LIBERO-plus leaderboard CSV: {leaderboard_csv}")
 
+        def _rate_cell(stats):
+            if stats['total_trials'] <= 0:
+                return "N/A", None
+            rate = stats['total_successes'] / stats['total_trials'] * 100
+            return f"{rate:.1f}", rate
+
+        matrix_rows = []
+        plus_suite_perturbations = {}
+        present_suites = [s for s in suite_names if suite_stats[s]['total_trials'] > 0]
+        print("\n=== LIBERO-plus Suite × Perturbation ===")
+        for suite in present_suites:
+            row = {'Suite': suite}
+            suite_payload = {}
+            suite_successes = 0
+            suite_trials = 0
+            for full_name, short_name in LEADERBOARD_CATEGORIES:
+                cell = suite_category_stats.get(
+                    (suite, full_name),
+                    {'total_trials': 0, 'total_successes': 0, 'total_tasks': 0},
+                )
+                text, rate = _rate_cell(cell)
+                row[short_name] = text
+                suite_payload[short_name] = {
+                    'category': full_name,
+                    'success_rate': rate,
+                    'total_tasks': cell['total_tasks'],
+                    'total_trials': cell['total_trials'],
+                    'total_successes': cell['total_successes'],
+                }
+                suite_successes += cell['total_successes']
+                suite_trials += cell['total_trials']
+            total_text, suite_rate = _rate_cell(
+                {'total_trials': suite_trials, 'total_successes': suite_successes}
+            )
+            row['Total'] = total_text
+            suite_payload['Total'] = {
+                'success_rate': suite_rate,
+                'total_trials': suite_trials,
+                'total_successes': suite_successes,
+            }
+            matrix_rows.append(row)
+            plus_suite_perturbations[suite] = suite_payload
+        overall_row = {'Suite': 'Overall'}
+        for short_name in [s for _, s in LEADERBOARD_CATEGORIES] + ['Total']:
+            overall_row[short_name] = plus_leaderboard[short_name]['success_rate']
+            if overall_row[short_name] is None:
+                overall_row[short_name] = "N/A"
+            else:
+                overall_row[short_name] = f"{overall_row[short_name]:.1f}"
+        matrix_rows.append(overall_row)
+        plus_suite_perturbations['Overall'] = plus_leaderboard
+        matrix_df = pd.DataFrame(matrix_rows)
+        print(matrix_df.to_string(index=False))
+        matrix_csv = os.path.join(output_dir, 'plus_suite_perturbations.csv')
+        matrix_df.to_csv(matrix_csv, index=False)
+        print(f"LIBERO-plus suite × perturbation CSV: {matrix_csv}")
+
     with open(summary_file, 'w') as f:
         payload = {
             'run_id': os.path.basename(output_dir),
@@ -347,6 +414,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None, libero_plus=False):
         }
         if plus_leaderboard is not None:
             payload['plus_leaderboard'] = plus_leaderboard
+            payload['plus_suite_perturbations'] = plus_suite_perturbations
         json.dump(payload, f, indent=4)
     
     print(f"\n=== Run Information ===")
@@ -355,6 +423,8 @@ def summarize_results(output_dir, *, ckpt=None, config=None, libero_plus=False):
     print(f"Summary file: {summary_file}")
     print(f"Summary CSV: {os.path.join(output_dir, 'summary.csv')}")
     print(f"Task success rates CSV: {os.path.join(output_dir, 'task_success_rates.csv')}")
+    if plus_leaderboard is not None:
+        print(f"Suite × perturbation CSV: {os.path.join(output_dir, 'plus_suite_perturbations.csv')}")
     
     # Print the task success-rate table (skip the huge plus dump in logs)
     if len(task_success_df) <= 80:
