@@ -17,9 +17,16 @@ def describe_eval_mot_mask(model: nn.Module, action_attend_mode: str | None = No
 
     if isinstance(model, FastWAMJointMultimodal):
         mode = action_attend_mode or "all"
+        streams = getattr(model, "enabled_video_streams", ("rgb", "depth", "flow"))
+        parts = ["R0", "R_fut"]
+        if "depth" in streams:
+            parts.append("D_fut")
+        if "flow" in streams:
+            parts.append("F_fut")
+        parts.append("A")
         return (
-            f"multistream joint MoT [R0|R_fut|D_fut|F_fut|A] "
-            f"(action_attend_mode={mode}; RGB input only)"
+            f"multistream joint MoT [{' | '.join(parts)}] "
+            f"(streams={list(streams)}; action_attend_mode={mode}; RGB input only)"
         )
     if isinstance(model, FastWAMJoint):
         return "joint MoT [R0|R_fut|A] (action attends all video)"
@@ -74,7 +81,6 @@ def build_action_infer_kwargs(
         if mode is not None:
             extra["action_attend_mode"] = str(mode)
     return extra
-
 
 def call_action_infer(
     model: nn.Module,
