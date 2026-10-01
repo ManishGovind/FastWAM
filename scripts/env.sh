@@ -7,12 +7,22 @@ export DIFFSYNTH_MODEL_BASE_PATH="${ROOT}/checkpoints"
 export DIFFSYNTH_DOWNLOAD_SOURCE="${DIFFSYNTH_DOWNLOAD_SOURCE:-huggingface}"
 export PATH="${ROOT}/.venv/bin:${PATH}"
 
+# Keep uv cache on /data rather than $HOME or /tmp.
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/data/mgovind/.cache/uv}"
+mkdir -p "${UV_CACHE_DIR}"
+
 # Triton / DeepSpeed autotune cache (avoid home NFS ~/.triton)
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/work/mgovind1/hf_cache/triton}"
 mkdir -p "${TRITON_CACHE_DIR}/autotune"
 
 NPP_LIB="$(find "$PWD/.venv" -name 'libnppicc.so.12' | head -1 | xargs dirname)"
 export LD_LIBRARY_PATH="$PWD/.ffmpeg-env/lib:${NPP_LIB}:${LD_LIBRARY_PATH:-}"
+
+# ImageMagick C library for LIBERO-plus sensor-noise (`wand`). Python stays in .venv.
+if [[ -d "${ROOT}/.deps/imagemagick/lib" ]]; then
+  export MAGICK_HOME="${ROOT}/.deps/imagemagick"
+  export LD_LIBRARY_PATH="${MAGICK_HOME}/lib:${LD_LIBRARY_PATH:-}"
+fi
 
 # CUDA toolkit (uv: nvidia-cuda-nvcc). cu12 wheels ship only ptxas; cu13 provides nvcc.
 CUDA_NVCC_HOME="${ROOT}/.venv/lib/python3.10/site-packages/nvidia/cu13"
