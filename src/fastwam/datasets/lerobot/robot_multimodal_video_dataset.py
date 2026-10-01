@@ -23,7 +23,7 @@ from .robot_video_dataset import DEFAULT_PROMPT, RobotVideoDataset
 
 logger = get_logger(__name__)
 
-_REQUIRED_MODALITIES = ("rgb", "depth", "flow")
+_KNOWN_MODALITIES = ("rgb", "depth", "flow")
 
 
 class RobotMultimodalVideoDataset(RobotVideoDataset):
@@ -44,21 +44,26 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         if modality_camera_groups is None:
             raise ValueError(
                 "`modality_camera_groups` is required, e.g. "
-                "{rgb: [0, 1], depth: [2, 3], flow: [4, 5]} indexing into pixel_values."
+                "{rgb: [0, 1], depth: [2, 3], flow: [4, 5]} indexing into pixel_values. "
+                "Omit unused streams (e.g. drop flow) to skip decoding those cameras."
             )
         groups = OmegaConf.to_container(modality_camera_groups, resolve=True)
         if not isinstance(groups, dict):
             raise ValueError(
                 f"`modality_camera_groups` must be a dict, got {type(groups)}"
             )
-        missing = [m for m in _REQUIRED_MODALITIES if m not in groups]
-        if missing:
+        if "rgb" not in groups:
+            raise ValueError("`modality_camera_groups` must include 'rgb'.")
+        unknown_keys = [str(k) for k in groups if str(k) not in _KNOWN_MODALITIES]
+        if unknown_keys:
             raise ValueError(
-                f"`modality_camera_groups` missing modalities {missing}; "
-                f"required={list(_REQUIRED_MODALITIES)}"
+                f"Unknown modalities {unknown_keys}; known={list(_KNOWN_MODALITIES)}"
             )
+        # Keep canonical order so packing / logging stay stable.
         self.modality_camera_groups: dict[str, list[int]] = {
-            str(name): [int(i) for i in indices] for name, indices in groups.items()
+            name: [int(i) for i in groups[name]]
+            for name in _KNOWN_MODALITIES
+            if name in groups
         }
 
         if zero_condition_modalities is not None and rgb_condition_modalities is not None:
@@ -73,11 +78,15 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             str(m) for m in (zero_condition_modalities or ())
         } - self.rgb_condition_modalities
 
-        unknown = (self.rgb_condition_modalities | self.zero_condition_modalities) - set(
-            self.modality_camera_groups
-        )
-        if unknown:
-            raise ValueError(f"Unknown condition modalities: {sorted(unknown)}")
+        present = set(self.modality_camera_groups)
+        dropped_cond = (self.rgb_condition_modalities | self.zero_condition_modalities) - present
+        if dropped_cond:
+            logger.warning(
+                "Ignoring condition modalities not in modality_camera_groups: %s",
+                sorted(dropped_cond),
+            )
+        self.rgb_condition_modalities &= present
+        self.zero_condition_modalities &= present
         if "rgb" in self.rgb_condition_modalities or "rgb" in self.zero_condition_modalities:
             raise ValueError("Cannot apply condition replacement to the rgb stream itself.")
 
@@ -182,18 +191,19 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         video_rgb = videos["rgb"]
         # Unimodal parity: [RGB_t0, depth/flow_t≥1]
         for modality in self.rgb_condition_modalities:
+            if modality not in videos:
+                continue
             videos[modality] = videos[modality].clone()
             videos[modality][:, 0] = video_rgb[:, 0]
         for modality in self.zero_condition_modalities:
+            if modality not in videos:
+                continue
             videos[modality] = videos[modality].clone()
             videos[modality][:, 0] = 0
 
-        video_depth = videos["depth"]
-        video_flow = videos["flow"]
-
         action = sample["action"]
         proprio = sample["proprio"][:-1, :]
-        for name, video in (("rgb", video_rgb), ("depth", video_depth), ("flow", video_flow)):
+        for name, video in videos.items():
             if video.shape[1] <= 1:
                 raise ValueError(
                     f"`video_{name}` must have at least 2 frames, got shape {tuple(video.shape)}"
@@ -211,9 +221,6 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
 
         data: dict[str, Any] = {
             "video": video_rgb,
-            "video_rgb": video_rgb,
-            "video_depth": video_depth,
-            "video_flow": video_flow,
             "action": action,
             "proprio": proprio,
             "prompt": instruction,
@@ -221,6 +228,8 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        for name, video in videos.items():
+            data[f"video_{name}"] = video
         if self.use_text_embed_cache:
             context, context_mask = self._get_cached_text_context(instruction)
             context[~context_mask] = 0.0

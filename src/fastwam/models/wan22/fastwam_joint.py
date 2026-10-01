@@ -112,6 +112,7 @@ class FastWAMJoint(FastWAM):
         rand_device: str = "cpu",
         tiled: bool = False,
         compile_action_infer: bool = False,
+        return_video_latents: bool = False,
     ) -> dict[str, Any]:
         del compile_action_infer
         self.eval()
@@ -235,6 +236,10 @@ class FastWAMJoint(FastWAM):
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
-        return {
+        out = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if return_video_latents:
+            # Frame 0 is clamped to the observation, so only the predicted future is returned.
+            out["video_latents"] = latents_video[0, :, 1:].detach().to(device="cpu", dtype=torch.float32)
+        return out

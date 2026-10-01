@@ -13,7 +13,7 @@ Inference:
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -46,18 +46,48 @@ class FastWAMJointMultimodal(FastWAMJoint):
         loss_lambda_rgb = float(kwargs.pop("loss_lambda_rgb", 1.0))
         loss_lambda_depth = float(kwargs.pop("loss_lambda_depth", 1.0))
         loss_lambda_flow = float(kwargs.pop("loss_lambda_flow", 1.0))
+        enabled_video_streams = kwargs.pop("enabled_video_streams", None)
+        stream_router_mode = str(kwargs.pop("stream_router_mode", "off")).lower()
+        stream_router_temperature = float(kwargs.pop("stream_router_temperature", 1.0))
         model = super().from_wan22_pretrained(**kwargs)
         model.loss_lambda_rgb = loss_lambda_rgb
         model.loss_lambda_depth = loss_lambda_depth
         model.loss_lambda_flow = loss_lambda_flow
+        model.enabled_video_streams = cls._normalize_enabled_streams(enabled_video_streams)
+
+        # Stream router is currently unused; keep kwargs accepted so Hydra configs
+        # with stream_router_* still instantiate cleanly.
+        del stream_router_mode, stream_router_temperature
+
         logger.info(
-            "FastWAMJointMultimodal loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
+            "FastWAMJointMultimodal streams=%s loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
+            list(model.enabled_video_streams),
             model.loss_lambda_rgb,
             model.loss_lambda_depth,
             model.loss_lambda_flow,
             model.loss_lambda_action,
         )
         return model
+
+    @staticmethod
+    def _normalize_enabled_streams(streams: Optional[Sequence[str]]) -> tuple[str, ...]:
+        if streams is None:
+            return _STREAM_KEYS
+        seen: list[str] = []
+        for raw in streams:
+            name = str(raw).lower()
+            if name not in _STREAM_KEYS:
+                raise ValueError(
+                    f"`enabled_video_streams` must be a subset of {_STREAM_KEYS}, got {streams!r}"
+                )
+            if name not in seen:
+                seen.append(name)
+        if "rgb" not in seen:
+            raise ValueError("`enabled_video_streams` must include 'rgb' (R0 condition).")
+        return tuple(name for name in _STREAM_KEYS if name in seen)
+
+    def _enabled_streams(self) -> tuple[str, ...]:
+        return getattr(self, "enabled_video_streams", _STREAM_KEYS)
 
     @staticmethod
     def _validate_action_attend_mode(action_attend_mode: str) -> str:
@@ -76,23 +106,27 @@ class FastWAMJointMultimodal(FastWAMJoint):
         video_tokens_per_frame: int,
         device: torch.device,
         action_attend_mode: str = "all",
+        enabled_streams: Optional[Sequence[str]] = None,
     ) -> torch.Tensor:
-        """Attention mask for [R0 | R_fut | D_fut | F_fut | A].
+        """Attention mask for enabled streams, e.g. [R0 | R_fut | D_fut | F_fut | A].
 
-        D0/F0 tokens are omitted from the MoT sequence (RGB condition is only R0).
-        Depth/flow still VAE-fuse RGB at latent t=0 during prepare, but those
-        condition tokens are not passed into attention.
+        Disabled streams are omitted. D0/F0 tokens are never in the MoT sequence.
 
           - R0 → R0 ; R_fut → R0 + R_fut
-          - D_fut → R0 + D_fut
-          - F_fut → R0 + F_fut
-          - Action → depends on ``action_attend_mode`` (training default: all)
+          - D_fut → R0 + D_fut (if depth enabled)
+          - F_fut → R0 + F_fut (if flow enabled)
+          - Action → enabled video keys allowed by ``action_attend_mode``
           - No cross-modality between futures; Video ↛ Action
         """
         action_attend_mode = self._validate_action_attend_mode(action_attend_mode)
-        if len(stream_seq_lens) != 3:
+        enabled = tuple(enabled_streams) if enabled_streams is not None else self._enabled_streams()
+        if list(enabled) != [n for n in _STREAM_KEYS if n in enabled]:
+            raise ValueError(f"`enabled_streams` must be in canonical order, got {enabled}")
+        if "rgb" not in enabled:
+            raise ValueError("`enabled_streams` must include 'rgb'.")
+        if len(stream_seq_lens) != len(enabled):
             raise ValueError(
-                f"Expected 3 stream_seq_lens (rgb_full, depth_fut, flow_fut), got {stream_seq_lens}"
+                f"stream_seq_lens length {len(stream_seq_lens)} != enabled streams {enabled}"
             )
         if any(s <= 0 for s in stream_seq_lens):
             raise ValueError(f"All stream_seq_lens must be positive, got {stream_seq_lens}")
@@ -101,63 +135,72 @@ class FastWAMJointMultimodal(FastWAMJoint):
                 f"`video_tokens_per_frame` must be positive, got {video_tokens_per_frame}"
             )
 
-        rgb_len, depth_fut_len, flow_fut_len = (int(s) for s in stream_seq_lens)
         tpf = int(video_tokens_per_frame)
+        seq_by_name = {name: int(length) for name, length in zip(enabled, stream_seq_lens)}
+        rgb_len = seq_by_name["rgb"]
         if rgb_len % tpf != 0:
             raise ValueError(
                 f"rgb stream seq_len must be divisible by tokens_per_frame, got {rgb_len}, {tpf}"
             )
-        if depth_fut_len % tpf != 0 or flow_fut_len % tpf != 0:
-            raise ValueError(
-                "depth/flow future seq_lens must be divisible by tokens_per_frame, "
-                f"got depth={depth_fut_len}, flow={flow_fut_len}, tpf={tpf}"
-            )
+        for name in enabled:
+            if name == "rgb":
+                continue
+            if seq_by_name[name] % tpf != 0:
+                raise ValueError(
+                    f"{name} future seq_len must be divisible by tokens_per_frame, "
+                    f"got {seq_by_name[name]}, {tpf}"
+                )
 
-        rgb_sl = slice(0, rgb_len)
+        offset = 0
+        slices: dict[str, slice] = {}
+        for name in enabled:
+            length = seq_by_name[name]
+            slices[name] = slice(offset, offset + length)
+            offset += length
+
+        rgb_sl = slices["rgb"]
         rgb_cond_sl = slice(0, tpf)
         rgb_fut_sl = slice(tpf, rgb_len)
-        depth_fut_sl = slice(rgb_len, rgb_len + depth_fut_len)
-        flow_fut_sl = slice(
-            rgb_len + depth_fut_len, rgb_len + depth_fut_len + flow_fut_len
-        )
+        depth_fut_sl = slices.get("depth")
+        flow_fut_sl = slices.get("flow")
 
-        video_seq_len = rgb_len + depth_fut_len + flow_fut_len
+        video_seq_len = offset
         total_seq_len = video_seq_len + int(action_seq_len)
         action_sl = slice(video_seq_len, total_seq_len)
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
 
         mask[rgb_cond_sl, rgb_cond_sl] = True
         mask[rgb_fut_sl, rgb_sl] = True
-        mask[depth_fut_sl, rgb_cond_sl] = True
-        mask[depth_fut_sl, depth_fut_sl] = True
-        mask[flow_fut_sl, rgb_cond_sl] = True
-        mask[flow_fut_sl, flow_fut_sl] = True
+        if depth_fut_sl is not None:
+            mask[depth_fut_sl, rgb_cond_sl] = True
+            mask[depth_fut_sl, depth_fut_sl] = True
+        if flow_fut_sl is not None:
+            mask[flow_fut_sl, rgb_cond_sl] = True
+            mask[flow_fut_sl, flow_fut_sl] = True
 
         mask[action_sl, action_sl] = True
+
+        def _attend(*maybe_slices: Optional[slice]) -> None:
+            for sl in maybe_slices:
+                if sl is not None:
+                    mask[action_sl, sl] = True
+
         if action_attend_mode == "all":
-            mask[action_sl, rgb_sl] = True
-            mask[action_sl, depth_fut_sl] = True
-            mask[action_sl, flow_fut_sl] = True
+            _attend(rgb_sl, depth_fut_sl, flow_fut_sl)
         elif action_attend_mode == "rgb":
-            mask[action_sl, rgb_sl] = True
+            _attend(rgb_sl)
         elif action_attend_mode == "depth":
-            mask[action_sl, rgb_cond_sl] = True
-            mask[action_sl, depth_fut_sl] = True
+            _attend(rgb_cond_sl, depth_fut_sl)
         elif action_attend_mode == "flow":
-            mask[action_sl, rgb_cond_sl] = True
-            mask[action_sl, flow_fut_sl] = True
+            _attend(rgb_cond_sl, flow_fut_sl)
         elif action_attend_mode == "rgb_depth":
-            mask[action_sl, rgb_sl] = True
-            mask[action_sl, depth_fut_sl] = True
+            _attend(rgb_sl, depth_fut_sl)
         elif action_attend_mode == "rgb_flow":
-            mask[action_sl, rgb_sl] = True
-            mask[action_sl, flow_fut_sl] = True
+            _attend(rgb_sl, flow_fut_sl)
         elif action_attend_mode == "depth_flow":
-            mask[action_sl, rgb_cond_sl] = True
-            mask[action_sl, depth_fut_sl] = True
-            mask[action_sl, flow_fut_sl] = True
+            _attend(rgb_cond_sl, depth_fut_sl, flow_fut_sl)
         elif action_attend_mode == "cond_only":
-            mask[action_sl, rgb_cond_sl] = True
+            _attend(rgb_cond_sl)
 
         return mask
 
@@ -284,8 +327,13 @@ class FastWAMJointMultimodal(FastWAMJoint):
         action_attend_mode: str = "all",
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         action_attend_mode = self._validate_action_attend_mode(action_attend_mode)
+        enabled = self._enabled_streams()
+        missing_latents = [name for name in enabled if name not in noisy_latents]
+        if missing_latents:
+            raise ValueError(f"Missing noisy latents for enabled streams: {missing_latents}")
+
         prepared = {}
-        for name in _STREAM_KEYS:
+        for name in enabled:
             (
                 video_tokens,
                 t_video,
@@ -321,7 +369,9 @@ class FastWAMJointMultimodal(FastWAMJoint):
         # Geometry must match across streams so RoPE / post unpatchify stay aligned.
         ref = prepared["rgb"]
         tpf = int(ref["tokens_per_frame"])
-        for name in ("depth", "flow"):
+        for name in enabled:
+            if name == "rgb":
+                continue
             cur = prepared[name]
             if (cur["f"], cur["h"], cur["w"], cur["tokens_per_frame"]) != (
                 ref["f"],
@@ -357,17 +407,16 @@ class FastWAMJointMultimodal(FastWAMJoint):
                 "drop_condition_tokens": True,
             }
 
-        mot_parts = {
-            "rgb": {**prepared["rgb"], "drop_condition_tokens": False},
-            "depth": _futures_only(prepared["depth"]),
-            "flow": _futures_only(prepared["flow"]),
-        }
+        mot_parts = {"rgb": {**prepared["rgb"], "drop_condition_tokens": False}}
+        for name in enabled:
+            if name != "rgb":
+                mot_parts[name] = _futures_only(prepared[name])
 
-        video_tokens = torch.cat([mot_parts[n]["tokens"] for n in _STREAM_KEYS], dim=1)
-        t_mod_video = torch.cat([mot_parts[n]["t_mod"] for n in _STREAM_KEYS], dim=1)
-        freqs_video = torch.cat([mot_parts[n]["freqs"] for n in _STREAM_KEYS], dim=0)
+        video_tokens = torch.cat([mot_parts[n]["tokens"] for n in enabled], dim=1)
+        t_mod_video = torch.cat([mot_parts[n]["t_mod"] for n in enabled], dim=1)
+        freqs_video = torch.cat([mot_parts[n]["freqs"] for n in enabled], dim=0)
         context_mask_video = torch.cat(
-            [mot_parts[n]["context_mask"] for n in _STREAM_KEYS], dim=1
+            [mot_parts[n]["context_mask"] for n in enabled], dim=1
         )
         context_video = mot_parts["rgb"]["context"]
 
@@ -385,13 +434,14 @@ class FastWAMJointMultimodal(FastWAMJoint):
             context_mask=context_mask,
         )
 
-        stream_seq_lens = [int(mot_parts[n]["tokens"].shape[1]) for n in _STREAM_KEYS]
+        stream_seq_lens = [int(mot_parts[n]["tokens"].shape[1]) for n in enabled]
         attention_mask = self._build_multistream_mot_attention_mask(
             stream_seq_lens=stream_seq_lens,
             action_seq_len=action_tokens.shape[1],
             video_tokens_per_frame=tpf,
             device=video_tokens.device,
             action_attend_mode=action_attend_mode,
+            enabled_streams=enabled,
         )
 
         video_tokens_out, action_tokens_out = self.mot.forward_joint_core(
@@ -410,7 +460,7 @@ class FastWAMJointMultimodal(FastWAMJoint):
 
         pred_video = {}
         offset = 0
-        for name, seq_len in zip(_STREAM_KEYS, stream_seq_lens):
+        for name, seq_len in zip(enabled, stream_seq_lens):
             chunk = video_tokens_out[:, offset : offset + seq_len]
             part = mot_parts[name]
             pred = self.video_expert.post(
@@ -431,17 +481,18 @@ class FastWAMJointMultimodal(FastWAMJoint):
         return pred_video, pred_action
 
     def training_loss(self, sample, tiled: bool = False):
-        missing = [f"video_{k}" for k in _STREAM_KEYS if f"video_{k}" not in sample]
+        enabled = self._enabled_streams()
+        missing = [f"video_{k}" for k in enabled if f"video_{k}" not in sample]
         if missing:
             raise ValueError(
-                f"FastWAMJointMultimodal.training_loss requires {list(_STREAM_KEYS)} video keys; "
+                f"FastWAMJointMultimodal.training_loss requires enabled video keys {list(enabled)}; "
                 f"missing {missing}."
             )
 
         stream_latents: dict[str, torch.Tensor] = {}
         first_frames: dict[str, Optional[torch.Tensor]] = {}
         fuse_flag = False
-        for name in _STREAM_KEYS:
+        for name in enabled:
             latents, first_frame, fuse = self._encode_stream_latents(
                 sample[f"video_{name}"], tiled=tiled
             )
@@ -451,7 +502,9 @@ class FastWAMJointMultimodal(FastWAMJoint):
 
         batch_size = stream_latents["rgb"].shape[0]
         num_frames = int(sample["video_rgb"].shape[2])
-        for name in ("depth", "flow"):
+        for name in enabled:
+            if name == "rgb":
+                continue
             if stream_latents[name].shape != stream_latents["rgb"].shape:
                 raise ValueError(
                     f"Latent shape mismatch for '{name}': "
@@ -476,7 +529,7 @@ class FastWAMJointMultimodal(FastWAMJoint):
         )
         noisy_latents: dict[str, torch.Tensor] = {}
         target_video: dict[str, torch.Tensor] = {}
-        for name in _STREAM_KEYS:
+        for name in enabled:
             noise = torch.randn_like(stream_latents[name])
             noisy = self.train_video_scheduler.add_noise(
                 stream_latents[name], noise, timestep_video
@@ -517,10 +570,10 @@ class FastWAMJointMultimodal(FastWAMJoint):
             "flow": float(self.loss_lambda_flow),
         }
         loss_video_total = None
-        loss_dict: dict[str, float] = {}
+        loss_dict: dict[str, float] = {f"loss_video_{name}": 0.0 for name in _STREAM_KEYS}
         video_weight = self.train_video_scheduler.training_weight(timestep_video)
 
-        for name in _STREAM_KEYS:
+        for name in enabled:
             pred = pred_video[name]
             tgt = target_video[name]
             if first_frames[name] is not None:
@@ -560,7 +613,7 @@ class FastWAMJointMultimodal(FastWAMJoint):
         loss_action_weighted = self.loss_lambda_action * loss_action
         loss_dict["loss_action"] = float(loss_action_weighted.detach().item())
         loss_dict["loss_video"] = float(
-            sum(loss_dict[f"loss_video_{n}"] for n in _STREAM_KEYS)
+            sum(loss_dict[f"loss_video_{n}"] for n in enabled)
         )
 
         loss_total = loss_video_total + loss_action_weighted
@@ -668,7 +721,8 @@ class FastWAMJointMultimodal(FastWAMJoint):
 
         latents_video: dict[str, torch.Tensor] = {}
         first_frames: dict[str, torch.Tensor] = {}
-        for stream_idx, name in enumerate(_STREAM_KEYS):
+        enabled = self._enabled_streams()
+        for stream_idx, name in enumerate(enabled):
             generator = None
             if seed is not None:
                 generator = torch.Generator(device=rand_device).manual_seed(int(seed) + stream_idx)
@@ -684,7 +738,7 @@ class FastWAMJointMultimodal(FastWAMJoint):
 
         action_generator = None
         if seed is not None:
-            action_generator = torch.Generator(device=rand_device).manual_seed(int(seed) + len(_STREAM_KEYS))
+            action_generator = torch.Generator(device=rand_device).manual_seed(int(seed) + len(enabled))
         latents_action = torch.randn(
             (1, action_horizon, self.action_expert.action_dim),
             generator=action_generator,
@@ -700,7 +754,8 @@ class FastWAMJointMultimodal(FastWAMJoint):
         tiled: bool,
     ) -> dict[str, Any]:
         decoded = {
-            name: self._decode_latents(latents_video[name], tiled=tiled) for name in _STREAM_KEYS
+            name: self._decode_latents(latents_video[name], tiled=tiled)
+            for name in self._enabled_streams()
         }
         decoded["video"] = decoded["rgb"]
         return decoded
@@ -755,7 +810,7 @@ class FastWAMJointMultimodal(FastWAMJoint):
                 action_condition=action_condition,
                 action_attend_mode=action_attend_mode,
             )
-            for name in _STREAM_KEYS:
+            for name in self._enabled_streams():
                 latents_video[name] = self.infer_video_scheduler.step(
                     pred_video[name], step_delta_video, latents_video[name]
                 )
@@ -909,9 +964,9 @@ class FastWAMJointMultimodal(FastWAMJoint):
         decoded = self._decode_stream_videos(latents_video, tiled=tiled)
         return {
             "video": decoded["rgb"],
-            "video_rgb": decoded["rgb"],
-            "video_depth": decoded["depth"],
-            "video_flow": decoded["flow"],
+            "video_rgb": decoded.get("rgb"),
+            "video_depth": decoded.get("depth"),
+            "video_flow": decoded.get("flow"),
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
             "action_attend_mode": action_attend_mode,
         }

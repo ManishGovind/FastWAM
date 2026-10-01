@@ -194,15 +194,19 @@ class Wan22Trainer:
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
         )
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            sampler=self.train_sampler,
-            num_workers=self.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            worker_init_fn=worker_init_fn,
-        )
+        loader_kwargs = {
+            "batch_size": self.batch_size,
+            "shuffle": False,
+            "sampler": self.train_sampler,
+            "num_workers": self.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+            "worker_init_fn": worker_init_fn,
+        }
+        if self.num_workers > 0:
+            # Keep workers warm across epochs; prefetch a few batches ahead.
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 4
+        return DataLoader(dataset, **loader_kwargs)
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
         if not hasattr(dataset, "__len__"):
