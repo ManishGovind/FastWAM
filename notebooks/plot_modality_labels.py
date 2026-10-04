@@ -22,8 +22,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from modality_action_labels import OUT_DIR, _load, _tag  # noqa: E402
-from modality_labels import MODELS, SUITES  # noqa: E402
+from modality_action_labels import MODELS, OUT_DIR, SUITES, _load, _tag  # noqa: E402
 
 FRAME_STRIDE = 4
 TAG = _tag(0, 8, FRAME_STRIDE, (0, 1, 2, 3))
@@ -103,26 +102,18 @@ def main() -> None:
     fig.savefig(FIG_DIR / "per_task.png", dpi=110)
     plt.close(fig)
 
-    # 3. How decisive the labels are: margin of best over second best, and seed-half agreement.
+    # 3. How decisive the labels are: margin of best over second best.
     err = d["weighted_action_loss"]
     srt = np.sort(err, 1)
     margin = (srt[:, 1] - srt[:, 0]) / srt[:, 1].clip(min=1e-8) * 100
-    agree = d["label_half_a"] == np.argmin(d["loss_half_b"], 1)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
     for m in range(3):
-        axes[0].hist(margin[lab == m], bins=np.linspace(0, 100, 51), alpha=0.6, color=COLORS[m],
-                     label=f"{MODELS[m]} best (median {np.median(margin[lab == m]):.0f}%)")
-    axes[0].set_xlabel("how much lower the best model's error is than the runner-up (%)")
-    axes[0].set_ylabel("windows")
-    axes[0].legend()
-    qs = np.quantile(margin, np.linspace(0, 1, 11))
-    mb = np.clip(np.searchsorted(qs, margin, side="right") - 1, 0, 9)
-    axes[1].plot(range(10), [agree[mb == b].mean() for b in range(10)], "o-")
-    axes[1].set_xticks(range(10), [f"{qs[b]:.0f}-{qs[b + 1]:.0f}" for b in range(10)], rotation=45)
-    axes[1].set_xlabel("margin decile (%)")
-    axes[1].set_ylabel("label agrees between seeds {0,2} and {1,3}")
-    axes[1].set_ylim(0, 1)
-    fig.suptitle("Label confidence")
+        ax.hist(margin[lab == m], bins=np.linspace(0, 100, 51), alpha=0.6, color=COLORS[m],
+                label=f"{MODELS[m]} best (median {np.median(margin[lab == m]):.0f}%)")
+    ax.set_xlabel("how much lower the best model's error is than the runner-up (%)")
+    ax.set_ylabel("windows")
+    ax.legend()
+    ax.set_title("Label confidence (error margin)")
     fig.tight_layout()
     fig.savefig(FIG_DIR / "margin.png", dpi=110)
     plt.close(fig)

@@ -1,11 +1,11 @@
 """Train the offline modality router on loss-based proxy labels.
 
 Input is ``labels_<tag>.pt`` from ``modality_action_labels.py --analyze``: per window the
-router features (pooled R0, T5 text, proprio) and each expert's weighted action error.
+router features matching the in-graph router (``r0_pool``, ``context_mean``) and each
+expert's weighted action error. ``context_mean`` is the masked mean of MoT context
+*after* proprio append — same as ``FastWAMJointMultimodalSelect._build_router_features``.
 
-All routers use **hard CE** on the argmin action-error label (no soft targets). Feature
-ablations (all / R0+proprio / text / …) are trained and written to ``routers_hard.pt``
-by default. Optional ``--label-seeds half-a`` trains on even seeds and scores on odd.
+All routers use **hard CE** on the argmin action-error label (no soft targets).
 Train/val/test are always split by episode, stratified per suite.
 
 Usage::
@@ -27,9 +27,15 @@ import torch.nn.functional as F
 MODELS = ("RGB", "Depth", "Flow")
 
 
+def _as_np(x):
+    """Labels export may store torch tensors (protocol-4) or numpy arrays."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
 class ModalityRouter(nn.Module):
-    """Each feature group gets its own LayerNorm + projection so the 4096-d text vector
-    cannot drown out the 192-d image and 8-d proprio parts."""
+    """Per-group LayerNorm + projection (same layout as in-graph ``modality_router``)."""
 
     def __init__(self, dims: dict[str, int], d: int = 128, hidden: int = 256, dropout: float = 0.1):
         super().__init__()
@@ -39,8 +45,10 @@ class ModalityRouter(nn.Module):
             nn.SiLU(), nn.Dropout(dropout), nn.Linear(d * len(dims), hidden), nn.SiLU(),
             nn.Dropout(dropout), nn.Linear(hidden, len(MODELS)),
         )
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
+        # nn.init.zeros_(self.head[-1].weight)
+        # nn.init.zeros_(self.head[-1].bias)
+        nn.init.kaiming_normal_(self.head[2].weight, nonlinearity='relu')
+        nn.init.kaiming_normal_(self.head[5].weight, nonlinearity='relu')
 
     def forward(self, feats: dict[str, torch.Tensor]) -> torch.Tensor:
         return self.head(torch.cat([self.proj[k](feats[k]) for k in self.names], dim=-1))
@@ -57,12 +65,12 @@ def split_by_episode(episodes: np.ndarray, suites: np.ndarray, seed: int, frac=(
     return (np.isin(episodes, train), np.isin(episodes, val), np.isin(episodes, test))
 
 
-def evaluate(pick: np.ndarray, loss_b: np.ndarray, label_b: np.ndarray, sel: np.ndarray) -> dict:
-    """Loss of the picked model on held-out draws, plus accuracy vs the half-B label."""
+def evaluate(pick: np.ndarray, loss: np.ndarray, label: np.ndarray, sel: np.ndarray) -> dict:
+    """Loss of the picked model on selected windows, plus accuracy vs the GT label."""
     idx = np.where(sel)[0]
     return {
-        "loss": float(loss_b[idx, pick[idx]].mean()),
-        "acc": float((pick[idx] == label_b[idx]).mean()),
+        "loss": float(loss[idx, pick[idx]].mean()),
+        "acc": float((pick[idx] == label[idx]).mean()),
         "picks": np.bincount(pick[idx], minlength=3).tolist(),
     }
 
@@ -154,31 +162,31 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--kl", "--kl-uniform", type=float, default=0.0, dest="kl",
                    help="weight on KL(Uniform || mean softmax); >0 blocks always-Depth collapse")
-    parser.add_argument("--label-seeds", choices=("all", "half-a"), default="all",
-                        help="all = mean error over seeds 0-3 (default); half-a = train on even, score on odd")
     parser.add_argument("--tag", type=str, default="hard",
                         help="suffix for output files (default hard -> routers_hard.pt); empty string to omit")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     d = torch.load(args.labels, map_location="cpu", weights_only=False)
-    if args.label_seeds == "all":
-        # Mean action error over all collected seeds → one hard label per window.
-        loss_train = loss_score = d["weighted_action_loss"]  # [N, M]
-        label_train = label_score = d["label"]
-        oracle_name = "oracle (all-seed label)"
-    else:
-        loss_train, loss_score = d["loss_half_a"], d["loss_half_b"]
-        label_train, label_score = loss_train.argmin(1), loss_score.argmin(1)
-        oracle_name = "oracle (half-A label)"
+    # Mean action error over all collected seeds → one hard label per window.
+    loss_train = loss_score = _as_np(d["weighted_action_loss"]).astype(np.float32)  # [N, M]
+    label_train = label_score = _as_np(d["label"]).astype(np.int64)
+    oracle_name = "oracle (all-seed label)"
     n = len(label_train)
-    masks = split_by_episode(d["episode"], d["suite"], args.seed)
+    masks = split_by_episode(_as_np(d["episode"]), _as_np(d["suite"]), args.seed)
     tr, va, te = masks
 
-    # Standardize features on train only.
+    if "context_mean" not in d:
+        raise KeyError(
+            f"{args.labels} has no `context_mean`. Re-run "
+            "`modality_action_labels.py --analyze` (backfills from RGB model) "
+            "or re-collect RGB features."
+        )
+
+    # Standardize features on train only (same groups as in-graph router).
     feats = {}
-    for g in ("r0_pool", "text_mean", "proprio"):
-        x = d[g].astype(np.float32)
+    for g in ("r0_pool", "context_mean"):
+        x = _as_np(d[g]).astype(np.float32)
         mu, sd = x[tr].mean(0), x[tr].std(0) + 1e-6
         feats[g] = (x - mu) / sd
 
@@ -186,7 +194,8 @@ def main() -> None:
     class_w = (counts.sum() / np.maximum(counts, 1) / 3).astype(np.float32)
 
     print(f"{n} windows | train {tr.sum()} / val {va.sum()} / test {te.sum()} (split by episode)")
-    print(f"label-seeds={args.label_seeds} | hard CE | train label counts R/D/F = {counts.tolist()}")
+    print(f"hard CE | train label counts R/D/F = {counts.tolist()}")
+    print(f"features: r0_pool {feats['r0_pool'].shape[1]}-d + context_mean {feats['context_mean'].shape[1]}-d")
     if args.kl > 0:
         print(f"loss = CE + {args.kl:g} * KL(Uniform || mean_p)  (anti-collapse)")
 
@@ -198,22 +207,20 @@ def main() -> None:
             rows["always " + MODELS[m]] = evaluate(np.full(n, m), loss_score, label_score, te)
     rows[oracle_name] = evaluate(label_train, loss_score, label_score, te)
 
-    # Per-task prior: most frequent train label of the instruction in train (text only, no model).
-    task_key = np.array([hash(v.tobytes()) for v in d["text_mean"]])
+    # Per-task prior: most frequent train label of the instruction in train.
+    task_feat = _as_np(d["text_mean"]) if "text_mean" in d else _as_np(d["context_mean"])
+    task_key = np.array([hash(v.tobytes()) for v in task_feat])
     prior = {}
     for t in np.unique(task_key[tr]):
         prior[t] = int(np.bincount(label_train[tr & (task_key == t)], minlength=3).argmax())
     rows["per-task majority"] = evaluate(
         np.array([prior.get(t, best_single) for t in task_key]), loss_score, label_score, te)
 
-    # All feature ablations use hard CE on the argmin action-error label (no soft targets).
+    # Feature ablations aligned with in-graph groups.
     configs = {
-        "router hard CE (all feats)": dict(groups=("r0_pool", "text_mean", "proprio"), soft=False, target=label_train),
-        "router hard, R0+proprio": dict(groups=("r0_pool", "proprio"), soft=False, target=label_train),
-        "router hard, text only": dict(groups=("text_mean",), soft=False, target=label_train),
-        "router hard, text+proprio": dict(groups=("text_mean", "proprio"), soft=False, target=label_train),
+        "router hard CE (all feats)": dict(groups=("r0_pool", "context_mean"), soft=False, target=label_train),
         "router hard, R0 only": dict(groups=("r0_pool",), soft=False, target=label_train),
-        "router hard, proprio only": dict(groups=("proprio",), soft=False, target=label_train),
+        "router hard, context only": dict(groups=("context_mean",), soft=False, target=label_train),
     }
 
     saved, picks = {}, {}
@@ -233,22 +240,22 @@ def main() -> None:
         print_confusion(name, picks[name]["pick"], label_score, te)
 
     base = rows["always " + MODELS[best_single]]["loss"]
-    score_note = "held-out episodes" + ("" if args.label_seeds == "all" else ", held-out draws")
-    print(f"\n{('test set (' + score_note + ')'):46s} {'loss':>10s} {'vs best':>8s} {'acc':>6s}  picks R/D/F")
+    print(f"\n{('test set (held-out episodes)'):46s} {'loss':>10s} {'vs best':>8s} {'acc':>6s}  picks R/D/F")
     for name, r in rows.items():
         print(f"{name:46s} {r['loss']:10.6f} {100 * (1 - r['loss'] / base):+7.1f}% {r['acc']:6.2f}  {r['picks']}")
 
     out_dir = Path(args.labels).parent
     suffix = "" if args.kl <= 0 else f"_kl{args.kl:g}"
-    if args.label_seeds != "all":
-        suffix = f"{suffix}_halfa" if suffix else "_halfa"
     tag = args.tag.strip("_")
     if tag:
         suffix = f"{suffix}_{tag}" if suffix else f"_{tag}"
 
     best_name = min((k for k in rows if k.startswith("router")), key=lambda k: rows[k]["loss"])
     deploy_name = "router hard CE (all feats)" if "router hard CE (all feats)" in saved else best_name
-    feat_norm = {g: (d[g][tr].mean(0), d[g][tr].std(0) + 1e-6) for g in ("r0_pool", "text_mean", "proprio")}
+    feat_norm = {
+        g: (_as_np(d[g])[tr].mean(0), _as_np(d[g])[tr].std(0) + 1e-6)
+        for g in ("r0_pool", "context_mean")
+    }
     torch.save({
         "state_dict": saved[deploy_name].state_dict(),
         "config": deploy_name,
@@ -256,7 +263,6 @@ def main() -> None:
         "dims": {g: feats[g].shape[1] for g in configs[deploy_name]["groups"]},
         "feature_norm": feat_norm,
         "models": list(MODELS),
-        "label_seeds": args.label_seeds,
         "best_by_loss": best_name,
         "loss": "hard_ce",
         "kl": args.kl,
@@ -267,15 +273,14 @@ def main() -> None:
         "feature_norm": feat_norm,
         "models": list(MODELS),
         "kl": args.kl,
-        "label_seeds": args.label_seeds,
         "loss": "hard_ce",
     }, out_dir / f"routers{suffix}.pt")
     split = np.where(tr, "train", np.where(va, "val", "test"))
     torch.save({"keys": d["keys"], "split": split, "label": label_score, "models": list(MODELS),
-                "routers": picks, "label_seeds": args.label_seeds, "loss": "hard_ce"},
+                "routers": picks, "loss": "hard_ce"},
                out_dir / f"router_predictions{suffix}.pt")
     with open(out_dir / f"router_results{suffix}.json", "w") as fh:
-        json.dump({"labels": args.labels, "kl": args.kl, "label_seeds": args.label_seeds,
+        json.dump({"labels": args.labels, "kl": args.kl,
                    "loss": "hard_ce", "rows": rows, "best": best_name, "deploy": deploy_name}, fh, indent=2)
     print(f"\nlowest-loss router: {best_name}")
     print(f"deploy router: {deploy_name} -> {out_dir / f'router{suffix}.pt'}")

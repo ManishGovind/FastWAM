@@ -97,8 +97,8 @@ def main() -> None:
     d = torch.load(a.labels, map_location="cpu", weights_only=False)
     masks = split_by_episode(d["episode"], d["suite"], 0)
     tr, va, te = masks
-    loss_a, loss_b, loss_all = d["loss_half_a"], d["loss_half_b"], d["weighted_action_loss"]
-    label = loss_all.argmin(1)
+    loss_all = d["weighted_action_loss"]
+    label = d["label"] if "label" in d else loss_all.argmin(1)
 
     x = {}
     for g in ("r0_pool", "text_mean", "proprio"):
@@ -141,11 +141,6 @@ def main() -> None:
               f"Flow {auc(pr[te, 2] - pr[te, 1], flow_win[te]):.3f}")
     print(f"   {'episode progress alone':26s} RGB {auc(d['progress'][te], rgb_win[te]):.3f}   "
           f"Flow {auc(-np.abs(d['progress'][te] - 0.3), flow_win[te]):.3f}")
-    # 4. noise ceiling for ranking: other half of the seeds as the 'predictor' of the full label.
-    gap_a = loss_a[:, 1] - loss_a[:, 0]
-    print(f"   {'seeds {0,2} gap (ceiling)':26s} RGB {auc(gap_a[te], (loss_b[:, 0] < loss_b[:, 1])[te]):.3f}   "
-          f"Flow {auc((loss_a[:, 1] - loss_a[:, 2])[te], (loss_b[:, 2] < loss_b[:, 1])[te]):.3f}   "
-          "(half A predicting half B)")
 
     # 3. regression on the relative error gap: (Depth - RGB) / Depth and (Depth - Flow) / Depth.
     gap = np.stack([(loss_all[:, 1] - loss_all[:, m]) / loss_all[:, 1] for m in (0, 2)], 1).astype(np.float32)
@@ -162,24 +157,20 @@ def main() -> None:
         print(f"   {nm:22s} RGB gap R^2 {r2(out[te, 0], gap_clip[te, 0]):+.3f}   "
               f"Flow gap R^2 {r2(out[te, 1], gap_clip[te, 1]):+.3f}")
 
-    # 5. turn the learned signal into a choice: switch away from Depth only when the predicted gain is large.
-    print("\n5. switch from Depth to the model with the largest predicted gain when it exceeds a threshold "
-          "(test, scored on held-out seeds {1,3})")
-    base = loss_b[te, 1].mean()
+    # 4. turn the learned signal into a choice: switch away from Depth only when the predicted gain is large.
+    print("\n4. switch from Depth to the model with the largest predicted gain when it exceeds a threshold "
+          "(test episodes)")
+    base = loss_all[te, 1].mean()
     out = reg_out["all feats"][te]
     best_alt = np.where(out[:, 0] >= out[:, 1], 0, 2)
     gain = out.max(1)
     for th in (0.0, 0.05, 0.1, 0.15, 0.2):
         pick = np.where(gain > th, best_alt, 1)
-        err = loss_b[te][np.arange(te.sum()), pick].mean()
+        err = loss_all[te][np.arange(te.sum()), pick].mean()
         print(f"   threshold {th:4.2f}: switches {np.mean(pick != 1) * 100:5.1f}% of windows, "
               f"error {err:.6f} ({100 * (1 - err / base):+.2f}% vs always Depth)")
-    ideal = loss_b[te].min(1).mean()
-    print(f"   perfect knowledge of held-out seeds: {100 * (1 - ideal / base):+.1f}% (unreachable: pure seed noise)")
-    ga = np.clip(np.stack([(loss_a[:, 1] - loss_a[:, m]) / loss_a[:, 1] for m in (0, 2)], 1), -3, 1)
-    gb = np.clip(np.stack([(loss_b[:, 1] - loss_b[:, m]) / loss_b[:, 1] for m in (0, 2)], 1), -3, 1)
-    print(f"   {'ceiling: half A -> half B':22s} RGB corr^2 {np.corrcoef(ga[te, 0], gb[te, 0])[0, 1] ** 2:.3f}   "
-          f"Flow corr^2 {np.corrcoef(ga[te, 1], gb[te, 1])[0, 1] ** 2:.3f}   (how repeatable the gap is across seeds)")
+    ideal = loss_all[te].min(1).mean()
+    print(f"   perfect argmin of action error: {100 * (1 - ideal / base):+.1f}% vs always Depth")
 
 
 if __name__ == "__main__":
