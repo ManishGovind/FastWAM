@@ -19,6 +19,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from fastwam.utils.logging_config import get_logger
 
+from .modality_gt_labels import load_modality_gt_label_map, lookup_modality_gt_label
 from .robot_video_dataset import DEFAULT_PROMPT, RobotVideoDataset
 
 logger = get_logger(__name__)
@@ -37,6 +38,10 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         rgb_condition_modalities: Sequence[str] | None = ("depth", "flow"),
         # Optional: zeros frame-0 instead of RGB paste (mutually exclusive prefer rgb).
         zero_condition_modalities: Sequence[str] | None = None,
+        # Offline action-error GT labels (.pt from modality_action_labels --analyze).
+        modality_label_path: str | None = None,
+        modality_label_frame_stride: int | None = None,
+        modality_label_nearest: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -102,11 +107,36 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
                     f"{expected_cams - 1} from modality_camera_groups."
                 )
 
+        self.modality_label_nearest = bool(modality_label_nearest)
+        self._modality_gt_maps = None
+        self._modality_label_missing_warned = False
+        if modality_label_path:
+            epi = self.lerobot_dataset.episode_data_index
+            obs_size = int(getattr(self.lerobot_dataset, "obs_size", 1))
+            self._modality_gt_maps = load_modality_gt_label_map(
+                modality_label_path,
+                episode_from=epi["from"],
+                episode_to=epi["to"],
+                obs_size=obs_size,
+                frame_stride=modality_label_frame_stride,
+            )
+            n_ep = len(self._modality_gt_maps["episode_from"])
+            n_lab = len(self._modality_gt_maps["episode_labeled_idx"])
+            if n_lab < n_ep:
+                logger.warning(
+                    "Modality GT labels cover %d/%d episodes; remaining episodes "
+                    "(no labeled window starts) fall back to rgb=0 during training.",
+                    n_lab,
+                    n_ep,
+                )
+
         logger.info(
-            "RobotMultimodalVideoDataset modalities=%s rgb_condition=%s zero_condition=%s",
+            "RobotMultimodalVideoDataset modalities=%s rgb_condition=%s zero_condition=%s "
+            "modality_labels=%s",
             {k: v for k, v in self.modality_camera_groups.items()},
             sorted(self.rgb_condition_modalities),
             sorted(self.zero_condition_modalities),
+            modality_label_path or "off",
         )
 
     def _subsample_pixel_values(
@@ -195,11 +225,6 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
                 continue
             videos[modality] = videos[modality].clone()
             videos[modality][:, 0] = video_rgb[:, 0]
-        for modality in self.zero_condition_modalities:
-            if modality not in videos:
-                continue
-            videos[modality] = videos[modality].clone()
-            videos[modality][:, 0] = 0
 
         action = sample["action"]
         proprio = sample["proprio"][:-1, :]
@@ -227,6 +252,7 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
+            "dataset_index": int(sample_idx),
         }
         for name, video in videos.items():
             data[f"video_{name}"] = video
@@ -235,4 +261,22 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             context[~context_mask] = 0.0
             data["context"] = context
             data["context_mask"] = torch.ones_like(context_mask)
+        if self._modality_gt_maps is not None:
+            lab = lookup_modality_gt_label(
+                self._modality_gt_maps,
+                int(sample_idx),
+                nearest=self.modality_label_nearest,
+            )
+            if lab is None:
+                # No labeled window start in this episode (e.g. length < obs_size, or
+                # older label files that omitted some episodes). Default to rgb.
+                if not self._modality_label_missing_warned:
+                    logger.warning(
+                        "No modality GT label for dataset_index=%s (and possibly other "
+                        "unlabeled episodes); using rgb=0 fallback.",
+                        sample_idx,
+                    )
+                    self._modality_label_missing_warned = True
+                lab = 0
+            data["selected_modality"] = torch.tensor(int(lab), dtype=torch.long)
         return data

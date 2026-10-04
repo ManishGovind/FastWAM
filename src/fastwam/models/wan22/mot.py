@@ -725,10 +725,15 @@ class MoT(nn.Module):
         if missing:
             raise ValueError(f"Missing expert t_mod for {missing}")
 
-        if attention_mask.ndim != 2:
-            raise ValueError(f"`attention_mask` must be 2D [S, S], got shape {tuple(attention_mask.shape)}")
-        if attention_mask.shape[0] != attention_mask.shape[1]:
-            raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
+        if attention_mask.ndim not in (2, 3):
+            raise ValueError(
+                f"`attention_mask` must be 2D [S, S] or 3D [B, S, S], "
+                f"got shape {tuple(attention_mask.shape)}"
+            )
+        if attention_mask.shape[-1] != attention_mask.shape[-2]:
+            raise ValueError(
+                f"`attention_mask` must be square in trailing dims, got shape {tuple(attention_mask.shape)}"
+            )
 
         tokens_all = {k: v for k, v in embeds_all.items()}
 
@@ -784,10 +789,15 @@ class MoT(nn.Module):
             v_cat = torch.cat(v_chunks, dim=1)
 
             total_seq = q_cat.shape[1]
-            if attention_mask.shape[0] != total_seq:
+            if attention_mask.shape[-1] != total_seq:
                 raise ValueError(
                     "Attention mask seq length mismatch: "
-                    f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
+                    f"mask={attention_mask.shape[-1]} vs tokens={total_seq}"
+                )
+            if attention_mask.ndim == 3 and attention_mask.shape[0] != q_cat.shape[0]:
+                raise ValueError(
+                    "Attention mask batch mismatch: "
+                    f"mask B={attention_mask.shape[0]} vs tokens B={q_cat.shape[0]}"
                 )
 
             mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)

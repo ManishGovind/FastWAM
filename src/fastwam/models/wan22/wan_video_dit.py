@@ -15,6 +15,9 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+        # [S,S] broadcasts; [B,S,S] needs a heads dim for SDPA ([B,H,L,S]).
+        if ctx_mask is not None and ctx_mask.ndim == 3:
+            ctx_mask = ctx_mask.unsqueeze(1)
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
         return x

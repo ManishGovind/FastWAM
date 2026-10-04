@@ -86,6 +86,9 @@ class Wan22Trainer:
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
             trainable_params.extend(list(proprio_encoder.parameters()))
+        modality_router = getattr(self.model, "modality_router", None)
+        if modality_router is not None:
+            trainable_params.extend(list(modality_router.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -320,6 +323,10 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        modality_router = getattr(model, "modality_router", None)
+        if modality_router is not None:
+            modality_router.train()
+            modality_router.requires_grad_(True)
 
     @staticmethod
     def _batch_optional_tensor(tensor, *, name: str, batch_ndim: int) -> torch.Tensor:
