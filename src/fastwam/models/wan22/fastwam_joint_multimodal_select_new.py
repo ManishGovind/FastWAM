@@ -3,10 +3,54 @@
 Extends ``FastWAMJointMultimodal``. Training picks one future stream per sample and
 runs MoT as R0 + that future only. The base multistream (all futures) model lives
 in ``fastwam_joint_multimodal.py``.
+
+``_new`` variant of ``fastwam_joint_multimodal_select.py``. Only the inline
+(``modality_select=router``) path changes:
+
+* router features are detached, so the REINFORCE / entropy / collapse terms train
+  the router only and do not leak into ``proprio_encoder`` via the context token;
+* entropy and collapse-KL use the same tempered logits as sampling;
+* the REINFORCE reward is configurable (``router_reward``): ``action`` (default,
+  matches the action-error oracle) or ``task`` (video + action, with the video term
+  weighted by ``video_weight`` exactly as in ``loss_total``);
+* the baseline is configurable (``router_baseline``): ``batch`` mean, or a running
+  per-timestep-bucket EMA (``timestep_ema``) that removes the noise-level variance
+  from the advantage; the advantage is optionally std-normalized;
+* the router loss is only added to ``loss_total`` in train mode (eval-loss numbers
+  stay comparable with the other select modes);
+* ``router_warmup_steps`` (optimizer steps; default 0 = off): for the first N steps the
+  stream is drawn uniformly at random (like ``modality_select=random``) and the router
+  loss is multiplied by 0, so every branch trains equally before the router starts
+  choosing. Prevents the early rich-get-richer collapse onto whichever branch happens
+  to be ahead. Counted in ``training_loss`` calls / ``router_grad_accum``; restored
+  from the checkpoint ``step`` when resuming from a ``.pt``;
+* ``modality_prompt`` (default off): after the stream is chosen, the MoT context (video
+  and action cross-attention) is told which modality to predict. The router itself still
+  sees ``[instruction | proprio]``.
+  ``modality_prompt_mode=joint`` (default, as in the reference WAM paper): the condition
+  is appended to the instruction and encoded together, ``T5("<instruction> Predict the
+  depth video.")`` -> ``[combined | proprio]``. ``separate``: the condition is encoded alone
+  and its tokens are inserted, ``[instruction | condition | proprio]``. Training uses the
+  text cache (``scripts/precompute_modality_text_embeds.py``); inference encodes with
+  the loaded text encoder when available;
+* ``router_layout`` (default ``short``): ``short`` builds only ``[R0 | chosen future | A]``;
+  ``full`` builds the MM layout ``[R0 | R_fut | D_fut | F_fut | A]`` and a per-sample
+  one-hot mask lets the action attend only R0 + the chosen future.
+  ``router_video_loss`` (``chosen`` / ``all``) picks which futures get a video loss in
+  ``full``. Inference uses the same layout and one-hot code as training: all three
+  futures are in the MoT, only the chosen one is denoised, and the action attends only to
+  it (same action as the short layout up to numerics; ~3x the video tokens per step);
+* sampling vs argmax, the loss gate and the EMA update all key off
+  ``modality_router.training`` instead of ``self.training``: the trainer puts the
+  top-level model in eval mode and only re-enables train mode on submodules, so
+  ``self.training`` is always False during training.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import torch
@@ -19,14 +63,27 @@ from .fastwam_joint_multimodal import (
     FastWAMJointMultimodal,
     _STREAM_KEYS,
 )
-from .modality_router import ModalityRouter, collapse_kl
+from .modality_router_new import ModalityRouter, collapse_kl
 
 logger = get_logger(__name__)
 
 MODALITY_SELECT_MODES = ("all", "random", "router", "gt")
 _ROUTER_FEATURE_GROUPS = ("r0", "context")
+ROUTER_REWARDS = ("action", "task")
+ROUTER_BASELINES = ("batch", "timestep_ema")
+ROUTER_LAYOUTS = ("short", "full")
+ROUTER_VIDEO_LOSSES = ("chosen", "all")
+# Additive attention bias that hides a future from the action (finite: bf16-safe, and
+# its straight-through gradient stays finite for the Gumbel subclass).
+_GATE_OFF = -1.0e4
+DEFAULT_MODALITY_SENTENCES = {
+    "rgb": "Predict the RGB video.",
+    "depth": "Predict the depth video.",
+    "flow": "Predict the flow video.",
+}
+MODALITY_PROMPT_MODES = ("joint", "separate")
 
-class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
+class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
     """Like FastWAMJointMultimodal, with modality_select=random|gt|router|all."""
 
     @classmethod
@@ -39,6 +96,47 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         router_hidden = int(kwargs.pop("router_hidden", 256))
         router_dropout = float(kwargs.pop("router_dropout", 0.1))
         router_video_size = kwargs.pop("router_video_size", None)
+        router_reward = str(kwargs.pop("router_reward", "action")).lower()
+        router_baseline = str(kwargs.pop("router_baseline", "batch")).lower()
+        router_baseline_bins = int(kwargs.pop("router_baseline_bins", 10))
+        router_baseline_momentum = float(kwargs.pop("router_baseline_momentum", 0.99))
+        router_adv_normalize = bool(kwargs.pop("router_adv_normalize", True))
+        router_warmup_steps = int(kwargs.pop("router_warmup_steps", 0))
+        router_grad_accum = int(kwargs.pop("router_grad_accum", 1))
+        router_layout = str(kwargs.pop("router_layout", "short")).lower()
+        router_video_loss = str(kwargs.pop("router_video_loss", "chosen")).lower()
+        modality_prompt = bool(kwargs.pop("modality_prompt", False))
+        modality_prompt_sentences = kwargs.pop("modality_prompt_sentences", None)
+        modality_prompt_cache_dir = str(kwargs.pop("modality_prompt_cache_dir", "./data/text_embeds_cache/libero_modality"))
+        modality_prompt_context_len = int(kwargs.pop("modality_prompt_context_len", 128))
+        modality_prompt_enc_id = str(kwargs.pop("modality_prompt_enc_id", "wan22ti2v5b"))
+        modality_prompt_mode = str(kwargs.pop("modality_prompt_mode", "joint")).lower()
+        if modality_prompt_mode not in MODALITY_PROMPT_MODES:
+            raise ValueError(
+                f"`modality_prompt_mode` must be one of {MODALITY_PROMPT_MODES}, got {modality_prompt_mode!r}"
+            )
+        if router_layout not in ROUTER_LAYOUTS:
+            raise ValueError(f"`router_layout` must be one of {ROUTER_LAYOUTS}, got {router_layout!r}")
+        if router_video_loss not in ROUTER_VIDEO_LOSSES:
+            raise ValueError(
+                f"`router_video_loss` must be one of {ROUTER_VIDEO_LOSSES}, got {router_video_loss!r}"
+            )
+        if router_warmup_steps < 0:
+            raise ValueError(f"`router_warmup_steps` must be >= 0, got {router_warmup_steps}")
+        if router_grad_accum <= 0:
+            raise ValueError(f"`router_grad_accum` must be positive, got {router_grad_accum}")
+        if router_reward not in ROUTER_REWARDS:
+            raise ValueError(f"`router_reward` must be one of {ROUTER_REWARDS}, got {router_reward!r}")
+        if router_baseline not in ROUTER_BASELINES:
+            raise ValueError(
+                f"`router_baseline` must be one of {ROUTER_BASELINES}, got {router_baseline!r}"
+            )
+        if router_baseline_bins <= 0:
+            raise ValueError(f"`router_baseline_bins` must be positive, got {router_baseline_bins}")
+        if not 0.0 <= router_baseline_momentum < 1.0:
+            raise ValueError(
+                f"`router_baseline_momentum` must be in [0, 1), got {router_baseline_momentum}"
+            )
         # Peek before parent consumes it (tokenizer is None when load_text_encoder=false).
         text_context_len = int(kwargs.get("tokenizer_max_len", 128))
         # Parent builds streams / loss lambdas (and ignores legacy stream_router_*).
@@ -47,6 +145,46 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         model.stream_router_temperature = float(stream_router_temperature)
         model.router_entropy_coef = float(router_entropy_coef)
         model.router_collapse_kl = float(router_collapse_kl)
+        model.router_reward = router_reward
+        model.router_baseline = router_baseline
+        model.router_baseline_bins = router_baseline_bins
+        model.router_baseline_momentum = router_baseline_momentum
+        model.router_adv_normalize = router_adv_normalize
+        model.router_warmup_steps = router_warmup_steps
+        model.router_grad_accum = router_grad_accum
+        # training_loss calls with the router in train mode (micro-batches).
+        model._router_calls = 0
+        model.router_layout = router_layout
+        model.router_video_loss = router_video_loss
+        # Per-sample [B, K] additive gate on (action rows, future cols); see
+        # _build_multistream_mot_attention_mask / _action_stream_gate.
+        model._action_stream_log_gate = None
+        model.modality_prompt = modality_prompt
+        model.modality_prompt_mode = modality_prompt_mode
+        model.modality_prompt_sentences = dict(DEFAULT_MODALITY_SENTENCES)
+        if modality_prompt_sentences:
+            model.modality_prompt_sentences.update(
+                {str(k): str(v) for k, v in dict(modality_prompt_sentences).items()}
+            )
+        model._modality_prompt_cache_dir = modality_prompt_cache_dir
+        model._modality_prompt_context_len = modality_prompt_context_len
+        model._modality_prompt_enc_id = modality_prompt_enc_id
+        model._joint_prompt_cache = {}  # combined text -> (context [L, D], mask [L]) on CPU
+        model._modality_prompt_tokens = None  # separate mode: [S, K, D] canonical order
+        model._modality_prompt_mask = None  # [S, K]
+        if modality_prompt and modality_prompt_mode == "separate":
+            model._modality_prompt_tokens, model._modality_prompt_mask, model.modality_prompt_sentences = (
+                cls._load_modality_prompts(
+                    sentences=modality_prompt_sentences,
+                    cache_dir=modality_prompt_cache_dir,
+                    context_len=modality_prompt_context_len,
+                    enc_id=modality_prompt_enc_id,
+                )
+            )
+        # Running mean reward per action-timestep bucket (timestep_ema baseline).
+        # Not checkpointed: it re-warms in a few hundred steps after resume.
+        model._router_baseline_ema = None
+        model._router_baseline_seen = None
 
         model.modality_router = None
         if model.modality_select == "router":
@@ -59,14 +197,27 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             )
 
         logger.info(
-            "FastWAMJointMultimodalSelect streams=%s modality_select=%s "
-            "router_T=%.3f entropy=%.4f collapse_kl=%.4f "
+            "FastWAMJointMultimodalSelectNew streams=%s modality_select=%s "
+            "router_T=%.3f entropy=%.4f collapse_kl=%.4f reward=%s baseline=%s "
+            "(bins=%d momentum=%.3f) adv_normalize=%s warmup_steps=%d (grad_accum=%d) "
+            "layout=%s video_loss=%s modality_prompt=%s (%s) "
             "loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
             list(model.enabled_video_streams),
             model.modality_select,
             model.stream_router_temperature,
             model.router_entropy_coef,
             model.router_collapse_kl,
+            model.router_reward,
+            model.router_baseline,
+            model.router_baseline_bins,
+            model.router_baseline_momentum,
+            model.router_adv_normalize,
+            model.router_warmup_steps,
+            model.router_grad_accum,
+            model.router_layout,
+            model.router_video_loss,
+            model.modality_prompt,
+            model.modality_prompt_mode,
             model.loss_lambda_rgb,
             model.loss_lambda_depth,
             model.loss_lambda_flow,
@@ -76,7 +227,7 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
 
     @staticmethod
     def _build_modality_router(
-        model: "FastWAMJointMultimodalSelect",
+        model: "FastWAMJointMultimodalSelectNew",
         *,
         hidden: int,
         dropout: float,
@@ -185,6 +336,10 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Return (choices [B], logits [B,K] or None, log_probs [B,K] or None).
 
+        For ``router`` the returned logits are already divided by the temperature, so
+        ``log_probs == log_softmax(logits)`` and entropy / collapse-KL see the same
+        distribution that sampling uses.
+
         ``all``: (None, None, None)
         ``random``: uniform hard indices
         ``gt``: hard indices from ``selected_modality`` (offline action-error oracle)
@@ -246,10 +401,16 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
                 context=context,
                 context_mask=context_mask,
             )
-            logits = self.modality_router(feats)  # float32
             temp = max(float(getattr(self, "stream_router_temperature", 1.0)), 1e-4)
-            log_probs = F.log_softmax(logits / temp, dim=-1)
-            if self.training:
+            logits = self.modality_router(feats) / temp  
+            log_probs = F.log_softmax(logits, dim=-1)
+            # Router's own mode, not self.training: the trainer calls model.eval()
+            # and then re-enables train mode only on dit / proprio_encoder /
+            # modality_router, so self.training is False during training.
+            if self._router_in_warmup():
+                # Warm-up: uniform routing so every branch trains equally.
+                choices = torch.randint(logits.shape[-1], (logits.shape[0],), device=logits.device)
+            elif self._router_is_training():
                 choices = torch.multinomial(log_probs.exp(), num_samples=1).squeeze(-1)
             else:
                 choices = logits.argmax(dim=-1)
@@ -263,13 +424,17 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         context: torch.Tensor,
         context_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Same R0 + MoT context FastWAM training uses — no adaptive pool, no token mean."""
+        """Same R0 + MoT context FastWAM training uses — no adaptive pool, no token mean.
+
+        Detached: the context carries the trainable proprio token, and the router
+        losses must not update ``proprio_encoder`` (only MoT losses should).
+        """
         if r0_latent.ndim != 4:
             raise ValueError(f"`r0_latent` must be [B,C,H,W], got {tuple(r0_latent.shape)}")
         if context.ndim != 3:
             raise ValueError(f"`context` must be [B,L,D], got {tuple(context.shape)}")
-        r0 = r0_latent.float().flatten(1)
-        ctx = context.float()
+        r0 = r0_latent.detach().float().flatten(1)
+        ctx = context.detach().float()
         mask = context_mask.bool()
         router = self.modality_router
         if r0.shape[-1] != router.r0_dim:
@@ -288,13 +453,309 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             )
         return {"r0": r0, "context": ctx, "context_mask": mask}
 
+    def _router_is_training(self) -> bool:
+        """Train/eval mode of the router (see ``_apply_dit_only_train_mode``)."""
+        router = getattr(self, "modality_router", None)
+        return bool(router is not None and router.training)
+
+    def _router_in_warmup(self) -> bool:
+        """True during the first ``router_warmup_steps`` optimizer steps (train mode only)."""
+        warmup = int(getattr(self, "router_warmup_steps", 0))
+        if warmup <= 0 or not self._router_is_training():
+            return False
+        steps_done = int(getattr(self, "_router_calls", 0)) // int(getattr(self, "router_grad_accum", 1))
+        return steps_done < warmup
+
+    def _router_tick(self) -> None:
+        """Count one training_loss call (micro-batch) with the router in train mode."""
+        if self._router_is_training():
+            self._router_calls = int(getattr(self, "_router_calls", 0)) + 1
+
+    @torch.no_grad()
+    def _router_reward_baseline(
+        self,
+        reward: torch.Tensor,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample REINFORCE baseline ``[B]`` for a detached reward ``[B]``.
+
+        ``batch``: batch mean (the original behaviour).
+        ``timestep_ema``: running mean reward of the sample's action-noise bucket
+        (``sigma = t / num_train_timesteps`` split into ``router_baseline_bins``
+        equal bins). Per-sample loss is dominated by the sampled noise level, so
+        this removes most of the variance that is unrelated to the modality pick.
+        Buckets with no history yet fall back to the batch mean. The EMA is only
+        updated in train mode (router's own mode), after the baseline is read
+        (no self-leakage).
+        """
+        batch_mean = reward.mean().expand_as(reward)
+        if self.router_baseline == "batch":
+            return batch_mean
+
+        bins = int(self.router_baseline_bins)
+        if self._router_baseline_ema is None or self._router_baseline_ema.device != reward.device:
+            self._router_baseline_ema = torch.zeros(bins, device=reward.device, dtype=torch.float32)
+            self._router_baseline_seen = torch.zeros(bins, device=reward.device, dtype=torch.bool)
+        bucket = (sigma * bins).long().clamp_(0, bins - 1)
+        seen = self._router_baseline_seen[bucket]
+        baseline = torch.where(seen, self._router_baseline_ema[bucket], batch_mean)
+
+        if self._router_is_training():
+            m = float(self.router_baseline_momentum)
+            for b in bucket.unique().tolist():
+                r_b = reward[bucket == b].float().mean()
+                if bool(self._router_baseline_seen[b]):
+                    self._router_baseline_ema[b] = m * self._router_baseline_ema[b] + (1.0 - m) * r_b
+                else:
+                    self._router_baseline_ema[b] = r_b
+                    self._router_baseline_seen[b] = True
+        return baseline
+
+    @staticmethod
+    def _load_modality_prompts(
+        *,
+        sentences: Optional[dict],
+        cache_dir: str,
+        context_len: int,
+        enc_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Load the cached T5 tokens of one sentence per stream (canonical order).
+
+        Same cache / naming / prompt template as the task instructions
+        (``RobotVideoDataset``). Only the real (non-zero) tokens are kept, padded to the
+        longest sentence.
+        """
+        # Same wrapping as the instructions (dataset + precompute script), so the cache key
+        # and the encoding match exactly.
+        from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+
+        sent = dict(DEFAULT_MODALITY_SENTENCES)
+        if sentences:
+            sent.update({str(k): str(v) for k, v in dict(sentences).items()})
+        rows = []
+        for name in _STREAM_KEYS:
+            text = sent[name]
+            hashed = hashlib.sha256(DEFAULT_PROMPT.format(task=text).encode("utf-8")).hexdigest()
+            path = Path(cache_dir) / f"{hashed}.t5_len{context_len}.{enc_id}.pt"
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Missing modality prompt cache {path} for {name!r}: {text!r}. Run "
+                    f"`python scripts/precompute_text_embeds.py task=<task> override_instruction=\"{text}\"`."
+                )
+            payload = torch.load(path, map_location="cpu")
+            ctx = payload["context"].float()
+            real = (ctx.abs().amax(-1) > 0) & payload["mask"].bool()
+            rows.append(ctx[real])
+        k = max(int(r.shape[0]) for r in rows)
+        tokens = torch.zeros(len(rows), k, rows[0].shape[-1])
+        mask = torch.zeros(len(rows), k, dtype=torch.bool)
+        for i, r in enumerate(rows):
+            tokens[i, : r.shape[0]] = r
+            mask[i, : r.shape[0]] = True
+        logger.info(
+            "Loaded modality prompts (%d tokens max): %s",
+            k, {n: int(m.sum()) for n, m in zip(_STREAM_KEYS, mask)},
+        )
+        return tokens, mask, sent
+
+    def _joint_prompt_text(self, prompt: str, stream: str) -> str:
+        """Instruction + condition, e.g. ``"... instruction: <task> Predict the depth video."``."""
+        return f"{prompt} {self.modality_prompt_sentences[stream]}"
+
+    def _load_joint_prompt(self, text: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cached T5 context of ``text`` (same cache / naming as the instructions)."""
+        hit = self._joint_prompt_cache.get(text)
+        if hit is not None:
+            return hit
+        hashed = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        path = (
+            Path(self._modality_prompt_cache_dir)
+            / f"{hashed}.t5_len{self._modality_prompt_context_len}.{self._modality_prompt_enc_id}.pt"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing joint modality prompt cache {path} for {text!r}. Run "
+                "`python scripts/precompute_modality_text_embeds.py task=<task>`."
+            )
+        payload = torch.load(path, map_location="cpu")
+        hit = (payload["context"], payload["mask"].bool())
+        self._joint_prompt_cache[text] = hit
+        return hit
+
+    def _modality_prompt_context(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        stream_names: Sequence[str],
+        prompts: Optional[Sequence[str]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MoT context told which modality to predict (per sample).
+
+        ``stream_names``: one canonical stream name per sample (or one for the batch).
+        ``joint``: ``[T5(instruction + condition) | proprio]`` (needs ``prompts``);
+        ``separate``: ``[instruction | condition | proprio]``. No-op when off.
+        """
+        if not getattr(self, "modality_prompt", False):
+            return context, context_mask
+        if len(stream_names) == 1 and context.shape[0] > 1:
+            stream_names = list(stream_names) * int(context.shape[0])
+        if len(stream_names) != context.shape[0]:
+            raise ValueError(f"{len(stream_names)} stream names for batch {context.shape[0]}")
+        n_tail = 1 if getattr(self, "proprio_encoder", None) is not None else 0  # proprio token stays last
+        if self.modality_prompt_mode == "joint":
+            if prompts is None:
+                raise ValueError("modality_prompt_mode=joint needs the instruction `prompt` strings.")
+            prompts = list(prompts)
+            if len(prompts) == 1 and context.shape[0] > 1:
+                prompts = prompts * int(context.shape[0])
+            pairs = [self._load_joint_prompt(self._joint_prompt_text(p, n)) for p, n in zip(prompts, stream_names)]
+            jctx = torch.stack([c for c, _ in pairs]).to(device=context.device, dtype=context.dtype)
+            jmsk = torch.stack([m for _, m in pairs]).to(device=context_mask.device, dtype=context_mask.dtype)
+            tail = context[:, context.shape[1] - n_tail :]
+            mtail = context_mask[:, context.shape[1] - n_tail :]
+            return torch.cat([jctx, tail], dim=1), torch.cat([jmsk, mtail], dim=1)
+        idx = torch.tensor([_STREAM_KEYS.index(str(n)) for n in stream_names], device="cpu")
+        tok = self._modality_prompt_tokens[idx].to(device=context.device, dtype=context.dtype)
+        msk = self._modality_prompt_mask[idx].to(device=context_mask.device, dtype=context_mask.dtype)
+        head, tail = context[:, : context.shape[1] - n_tail], context[:, context.shape[1] - n_tail :]
+        mhead, mtail = context_mask[:, : context.shape[1] - n_tail], context_mask[:, context.shape[1] - n_tail :]
+        return torch.cat([head, tok, tail], dim=1), torch.cat([mhead, msk, mtail], dim=1)
+
+    def _infer_modality_context(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        stream: str,
+        *,
+        prompt: Optional[str],
+        proprio: Optional[torch.Tensor],
+        prompt_text: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inference MoT context for the chosen ``stream`` (router or fixed active_future).
+
+        ``prompt_text``: the instruction string when only the cached ``context`` was passed
+        (e.g. the trainer's periodic eval), used to look up the cached joint condition.
+        """
+        if not getattr(self, "modality_prompt", False):
+            return context, context_mask
+        if self.modality_prompt_mode == "joint" and prompt is not None and getattr(self, "text_encoder", None) is not None:
+            # Eval path: encode instruction + condition together, then append proprio as usual.
+            return self._resolve_infer_context(
+                prompt=self._joint_prompt_text(prompt, stream), proprio=proprio, context=None, context_mask=None
+            )
+        text = prompt if prompt is not None else prompt_text
+        return self._modality_prompt_context(
+            context, context_mask, [stream], prompts=None if text is None else [text]
+        )
+
+    def _infer_layout(self, active_future: Optional[str], action_attend_mode: str):
+        """(gate context, loop active_future, streams to denoise) for inference.
+
+        ``full`` + a chosen stream (same one-hot code as training): all three futures are
+        in the MoT, only the chosen one is denoised, and the action attends only to it.
+        Otherwise: the existing behaviour (short layout for a chosen stream).
+        """
+        if getattr(self, "router_layout", "short") != "full" or active_future is None:
+            return contextlib.nullcontext(), active_future, None
+        if action_attend_mode != "all":
+            logger.warning("router_layout=full needs action_attend_mode='all'; using the short layout.")
+            return contextlib.nullcontext(), active_future, None
+        enabled = self._enabled_streams()
+        choice = torch.tensor([enabled.index(active_future)], device=self.device)
+        gate = self._action_stream_gate(self._one_hot_gate(choice, len(enabled)).to(self.device))
+        return gate, None, (active_future,)
+
+    @contextlib.contextmanager
+    def _action_stream_gate(self, log_gate: torch.Tensor):
+        """Within this block, the MoT mask hides futures from the action per sample."""
+        self._action_stream_log_gate = log_gate
+        try:
+            yield
+        finally:
+            self._action_stream_log_gate = None
+
+    @staticmethod
+    def _one_hot_gate(choices: torch.Tensor, num_streams: int) -> torch.Tensor:
+        """(1 0 0) -> [0, -1e4, -1e4]: chosen future visible to the action, others hidden."""
+        hard = F.one_hot(choices.long(), num_streams).bool()
+        return torch.where(hard, 0.0, _GATE_OFF).float()
+
     @staticmethod
     def _slice_batch(x: Optional[torch.Tensor], idx: torch.Tensor) -> Optional[torch.Tensor]:
         if x is None:
             return None
         return x.index_select(0, idx)
 
+    # Which futures the action may read, per ``action_attend_mode`` (ablations).
+    _ACTION_SEES = {
+        "all": ("rgb", "depth", "flow"),
+        "rgb": ("rgb",),
+        "depth": ("depth",),
+        "flow": ("flow",),
+        "rgb_depth": ("rgb", "depth"),
+        "rgb_flow": ("rgb", "flow"),
+        "depth_flow": ("depth", "flow"),
+        "cond_only": (),
+    }
+
+    def _mot_blocks(
+        self,
+        stream_seq_lens: list[int],
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        enabled_streams: Optional[Sequence[str]],
+    ) -> tuple[tuple[str, ...], list[str], list[int]]:
+        """Blocks of the MoT sequence, in order, with their token lengths.
+
+        ``R0 | rgb | depth | flow | A``: R0 is frame 0 of the rgb stream, each stream
+        block is that stream's future tokens (may be empty for rgb in the short layout).
+        """
+        enabled = tuple(enabled_streams) if enabled_streams is not None else self._enabled_streams()
+        if list(enabled) != [n for n in _STREAM_KEYS if n in enabled]:
+            raise ValueError(f"`enabled_streams` must be in canonical order, got {enabled}")
+        if "rgb" not in enabled:
+            raise ValueError("`enabled_streams` must include 'rgb'.")
+        if len(stream_seq_lens) != len(enabled):
+            raise ValueError(f"stream_seq_lens length {len(stream_seq_lens)} != enabled streams {enabled}")
+        tpf = int(video_tokens_per_frame)
+        if tpf <= 0 or any(int(n) <= 0 for n in stream_seq_lens):
+            raise ValueError(f"Bad lengths: tokens_per_frame={tpf}, stream_seq_lens={stream_seq_lens}")
+        if any(int(n) % tpf for n in stream_seq_lens):
+            raise ValueError(f"stream_seq_lens {stream_seq_lens} must be multiples of tokens_per_frame {tpf}")
+        lens = dict(zip(enabled, (int(n) for n in stream_seq_lens)))
+        names = ["R0", *enabled, "A"]
+        sizes = [tpf, *(lens[n] - tpf if n == "rgb" else lens[n] for n in enabled), int(action_seq_len)]
+        return enabled, names, sizes
+
     @torch.no_grad()
+    def _build_multistream_mot_attention_mask_base(
+        self,
+        stream_seq_lens: list[int],
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        device: torch.device,
+        action_attend_mode: str = "all",
+        enabled_streams: Optional[Sequence[str]] = None,
+    ) -> torch.Tensor:
+        """Bool ``[S, S]`` mask (row may attend column), built from a block table:
+
+                    R0   rgb   depth  flow   A
+            R0      ✓
+            rgb     ✓    ✓
+            depth   ✓          ✓
+            flow    ✓                 ✓
+            A       ✓    (futures allowed by action_attend_mode)  ✓
+
+        Futures never see each other; video never sees the action.
+        """
+        mode = self._validate_action_attend_mode(action_attend_mode)
+        enabled, names, sizes = self._mot_blocks(stream_seq_lens, action_seq_len, video_tokens_per_frame, enabled_streams)
+        allow = {"R0": {"R0"}, "A": {"R0", "A", *self._ACTION_SEES[mode]}}
+        allow.update({n: {"R0", n} for n in enabled})
+        block = torch.tensor([[col in allow[row] for col in names] for row in names], dtype=torch.bool)
+        reps = torch.tensor(sizes)
+        return block.repeat_interleave(reps, 0).repeat_interleave(reps, 1).to(device)
+
     def _build_multistream_mot_attention_mask(
         self,
         stream_seq_lens: list[int],
@@ -304,101 +765,36 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         action_attend_mode: str = "all",
         enabled_streams: Optional[Sequence[str]] = None,
     ) -> torch.Tensor:
-        """Attention mask for enabled streams, e.g. [R0 | R_fut | D_fut | F_fut | A].
+        """Bool mask (``_base``), or inside ``_action_stream_gate`` a per-sample float mask
+        ``[B, S, S]``: the gate ``[B, K]`` (0 = visible, -1e4 = hidden) is added on the
+        action row, over each stream's future block.
 
-        Disabled streams are omitted. D0/F0 tokens are never in the MoT sequence.
-
-          - R0 → R0 ; R_fut → R0 + R_fut
-          - D_fut → R0 + D_fut (if depth enabled)
-          - F_fut → R0 + F_fut (if flow enabled)
-          - Action → enabled video keys allowed by ``action_attend_mode``
-          - No cross-modality between futures; Video ↛ Action
+        Not under ``no_grad``: the Gumbel subclass needs gradient through the gate.
         """
-        action_attend_mode = self._validate_action_attend_mode(action_attend_mode)
-        enabled = tuple(enabled_streams) if enabled_streams is not None else self._enabled_streams()
-        if list(enabled) != [n for n in _STREAM_KEYS if n in enabled]:
-            raise ValueError(f"`enabled_streams` must be in canonical order, got {enabled}")
-        if "rgb" not in enabled:
-            raise ValueError("`enabled_streams` must include 'rgb'.")
-        if len(stream_seq_lens) != len(enabled):
-            raise ValueError(
-                f"stream_seq_lens length {len(stream_seq_lens)} != enabled streams {enabled}"
-            )
-        if any(s <= 0 for s in stream_seq_lens):
-            raise ValueError(f"All stream_seq_lens must be positive, got {stream_seq_lens}")
-        if video_tokens_per_frame <= 0:
-            raise ValueError(
-                f"`video_tokens_per_frame` must be positive, got {video_tokens_per_frame}"
-            )
-
-        tpf = int(video_tokens_per_frame)
-        seq_by_name = {name: int(length) for name, length in zip(enabled, stream_seq_lens)}
-        rgb_len = seq_by_name["rgb"]
-        if rgb_len % tpf != 0:
-            raise ValueError(
-                f"rgb stream seq_len must be divisible by tokens_per_frame, got {rgb_len}, {tpf}"
-            )
-        for name in enabled:
-            if name == "rgb":
-                continue
-            if seq_by_name[name] % tpf != 0:
-                raise ValueError(
-                    f"{name} future seq_len must be divisible by tokens_per_frame, "
-                    f"got {seq_by_name[name]}, {tpf}"
-                )
-
-        offset = 0
-        slices: dict[str, slice] = {}
-        for name in enabled:
-            length = seq_by_name[name]
-            slices[name] = slice(offset, offset + length)
-            offset += length
-
-        rgb_sl = slices["rgb"]
-        rgb_cond_sl = slice(0, tpf)
-        rgb_fut_sl = slice(tpf, rgb_len)
-        depth_fut_sl = slices.get("depth")
-        flow_fut_sl = slices.get("flow")
-
-        video_seq_len = offset
-        total_seq_len = video_seq_len + int(action_seq_len)
-        action_sl = slice(video_seq_len, total_seq_len)
-        mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
-
-        mask[rgb_cond_sl, rgb_cond_sl] = True
-        mask[rgb_fut_sl, rgb_sl] = True
-        if depth_fut_sl is not None:
-            mask[depth_fut_sl, rgb_cond_sl] = True
-            mask[depth_fut_sl, depth_fut_sl] = True
-        if flow_fut_sl is not None:
-            mask[flow_fut_sl, rgb_cond_sl] = True
-            mask[flow_fut_sl, flow_fut_sl] = True
-
-        mask[action_sl, action_sl] = True
-
-        def _attend(*maybe_slices: Optional[slice]) -> None:
-            for sl in maybe_slices:
-                if sl is not None:
-                    mask[action_sl, sl] = True
-
-        if action_attend_mode == "all":
-            _attend(rgb_sl, depth_fut_sl, flow_fut_sl)
-        elif action_attend_mode == "rgb":
-            _attend(rgb_sl)
-        elif action_attend_mode == "depth":
-            _attend(rgb_cond_sl, depth_fut_sl)
-        elif action_attend_mode == "flow":
-            _attend(rgb_cond_sl, flow_fut_sl)
-        elif action_attend_mode == "rgb_depth":
-            _attend(rgb_sl, depth_fut_sl)
-        elif action_attend_mode == "rgb_flow":
-            _attend(rgb_sl, flow_fut_sl)
-        elif action_attend_mode == "depth_flow":
-            _attend(rgb_cond_sl, depth_fut_sl, flow_fut_sl)
-        elif action_attend_mode == "cond_only":
-            _attend(rgb_cond_sl)
-
-        return mask
+        base = self._build_multistream_mot_attention_mask_base(
+            stream_seq_lens=stream_seq_lens,
+            action_seq_len=action_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=device,
+            action_attend_mode=action_attend_mode,
+            enabled_streams=enabled_streams,
+        )
+        log_gate = getattr(self, "_action_stream_log_gate", None)
+        if log_gate is None:
+            return base
+        if action_attend_mode != "all":
+            raise ValueError("Per-sample action gate requires action_attend_mode='all'.")
+        enabled, _names, sizes = self._mot_blocks(stream_seq_lens, action_seq_len, video_tokens_per_frame, enabled_streams)
+        if log_gate.shape[-1] != len(enabled):
+            raise ValueError(f"log_gate K={log_gate.shape[-1]} != streams {enabled}")
+        g = log_gate.float()
+        zero = g.new_zeros(g.shape[0], 1)
+        block_bias = torch.cat([zero, g, zero], dim=1)  # [B, R0 | streams | A]
+        col_bias = block_bias.repeat_interleave(torch.tensor(sizes, device=g.device), dim=1)  # [B, S]
+        is_action_row = torch.zeros(base.shape[-1], device=device)
+        is_action_row[base.shape[-1] - int(action_seq_len):] = 1.0
+        base_f = torch.zeros(base.shape, device=device).masked_fill(~base, float("-inf"))
+        return (base_f[None] + is_action_row[None, :, None] * col_bias[:, None, :]).to(self.torch_dtype)
 
     def _encode_stream_latents(
         self,
@@ -815,6 +1211,16 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             context_mask=context_mask,
             selected_modality=selected_modality,
         )
+        # MoT context: instruction (+ chosen modality sentence) + proprio. The router above
+        # saw the context without the sentence.
+        ctx_mot, ctx_mask_mot = context, context_mask
+        if modality_choices is not None:
+            prompts = sample.get("prompt")
+            if isinstance(prompts, str):
+                prompts = [prompts]
+            ctx_mot, ctx_mask_mot = self._modality_prompt_context(
+                context, context_mask, [enabled[int(i)] for i in modality_choices.tolist()], prompts=prompts
+            )
 
         include_initial_video_step = first_frames["rgb"] is None
         lambdas = {
@@ -823,9 +1229,10 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             "flow": float(self.loss_lambda_flow),
         }
         loss_dict: dict[str, float] = {f"loss_video_{name}": 0.0 for name in _STREAM_KEYS}
+        # float32 like FastWAM.training_loss (no bf16 rounding of the timestep weight).
         video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
             device=stream_latents["rgb"].device,
-            dtype=stream_latents["rgb"].dtype,
+            dtype=torch.float32,
         )
         loss_video_per_sample = torch.zeros(
             batch_size, device=stream_latents["rgb"].device, dtype=torch.float32
@@ -841,13 +1248,17 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             idx: torch.Tensor,
             *,
             active_future: Optional[str],
+            full_choices: Optional[torch.Tensor] = None,
         ) -> None:
+            """``full_choices``: MM layout with a per-sample one-hot action mask."""
             nonlocal loss_video_per_sample, action_loss_per_sample
             if idx.numel() == 0:
                 return
 
             # Only ship latents needed for this MoT topology.
-            if active_future is None:
+            if full_choices is not None:
+                needed = enabled
+            elif active_future is None:
                 needed = enabled
             elif active_future == "rgb":
                 needed = ("rgb",)
@@ -855,17 +1266,24 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
                 needed = ("rgb", active_future)
             noisy_sub = {k: noisy_latents[k].index_select(0, idx) for k in needed}
             action_cond = action.index_select(0, idx) if action is not None else None
-            pred_video, pred_action = self._joint_denoise_multistream(
-                noisy_latents=noisy_sub,
-                latents_action=noisy_action.index_select(0, idx),
-                timestep_video=timestep_video.index_select(0, idx),
-                timestep_action=timestep_action.index_select(0, idx),
-                context=context.index_select(0, idx),
-                context_mask=self._slice_batch(context_mask, idx),
-                fuse_vae_embedding_in_latents=fuse_flag,
-                action_condition=action_cond,
-                active_future=active_future,
+            sub_choices = None if full_choices is None else full_choices.index_select(0, idx)
+            gate = (
+                contextlib.nullcontext()
+                if sub_choices is None
+                else self._action_stream_gate(self._one_hot_gate(sub_choices, len(enabled)).to(idx.device))
             )
+            with gate:
+                pred_video, pred_action = self._joint_denoise_multistream(
+                    noisy_latents=noisy_sub,
+                    latents_action=noisy_action.index_select(0, idx),
+                    timestep_video=timestep_video.index_select(0, idx),
+                    timestep_action=timestep_action.index_select(0, idx),
+                    context=ctx_mot.index_select(0, idx),
+                    context_mask=self._slice_batch(ctx_mask_mot, idx),
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                    action_condition=action_cond,
+                    active_future=None if sub_choices is not None else active_future,
+                )
 
             video_names = (
                 tuple(pred_video.keys())
@@ -887,9 +1305,15 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
                     include_initial_video_step=include_initial_video_step,
                 )
                 weighted_ps = lambdas[name] * loss_ps.float()
+                n_used = int(idx.numel())
+                if sub_choices is not None and self.router_video_loss == "chosen":
+                    # Full layout: only the chosen future of each sample gets a video loss.
+                    sel = (sub_choices == enabled.index(name)).float()
+                    weighted_ps = weighted_ps * sel
+                    n_used = int(sel.sum().item())
                 loss_video_per_sample[idx] = loss_video_per_sample[idx] + weighted_ps
                 stream_loss_acc[name] += float((weighted_ps * w_sub).sum().detach().item())
-                stream_loss_count[name] += int(idx.numel())
+                stream_loss_count[name] += n_used
 
             tgt_a = target_action.index_select(0, idx)
             action_loss_token = F.mse_loss(
@@ -909,6 +1333,9 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         if modality_choices is None:
             all_idx = torch.arange(batch_size, device=stream_latents["rgb"].device)
             _run_group(all_idx, active_future=None)
+        elif self.router_layout == "full":
+            all_idx = torch.arange(batch_size, device=stream_latents["rgb"].device)
+            _run_group(all_idx, active_future=None, full_choices=modality_choices)
         else:
             for stream_idx, name in enumerate(enabled):
                 idx = (modality_choices == stream_idx).nonzero(as_tuple=True)[0]
@@ -938,22 +1365,38 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
 
         loss_total = loss_video_total + loss_action_weighted
 
-        # Learned router: REINFORCE on per-sample task loss + entropy / collapse KL.
+        # Learned router: REINFORCE on a per-sample reward + entropy / collapse KL.
         if (
             getattr(self, "modality_select", "all") == "router"
             and router_logits is not None
             and router_log_probs is not None
             and modality_choices is not None
         ):
-            task_ps = loss_video_per_sample + self.loss_lambda_action * (
+            # Same per-sample terms (and weights) that enter loss_total.
+            action_ps = self.loss_lambda_action * (
                 action_loss_per_sample * action_weight.float()
             )
-            baseline = task_ps.detach().mean()
-            advantage = task_ps.detach() - baseline
+            if self.router_reward == "action":
+                # Matches the offline oracle (action error). Video losses of different
+                # streams are on different scales and would bias the pick.
+                reward_ps = action_ps
+            else:
+                reward_ps = loss_video_per_sample * video_weight.float() + action_ps
+            reward_ps = reward_ps.detach()
+
+            sigma = (
+                timestep_action.detach().float()
+                / float(self.train_action_scheduler.num_train_timesteps)
+            ).clamp(0.0, 1.0)
+            baseline = self._router_reward_baseline(reward_ps, sigma)
+            advantage = reward_ps - baseline
+            if self.router_adv_normalize and advantage.numel() > 1:
+                advantage = advantage / advantage.std().clamp_min(1e-6)
+
             chosen_log_prob = router_log_probs.gather(
                 1, modality_choices.unsqueeze(1)
             ).squeeze(1)
-            # Minimize E[task_loss]; high advantage → lower chosen log-prob.
+            # Minimize E[reward] (a loss); high advantage → lower chosen log-prob.
             pg_loss = (chosen_log_prob * advantage).mean()
             entropy = -(router_log_probs.exp() * router_log_probs).sum(dim=-1).mean()
             collapse = collapse_kl(router_logits)
@@ -962,13 +1405,25 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
                 - float(self.router_entropy_coef) * entropy
                 + float(self.router_collapse_kl) * collapse
             )
-            loss_total = loss_total + router_loss
+            in_warmup = self._router_in_warmup()
+            if self._router_is_training():
+                # x0 in warm-up: router gets zero grads (keeps DeepSpeed happy) and stays put.
+                loss_total = loss_total + (0.0 if in_warmup else 1.0) * router_loss
+            loss_dict["router_warmup"] = float(in_warmup)
             loss_dict["loss_router"] = float(router_loss.detach().item())
+            loss_dict["router_pg"] = float(pg_loss.detach().item())
+            loss_dict["router_reward"] = float(reward_ps.mean().item())
+            loss_dict["router_adv_abs"] = float(advantage.abs().mean().item())
             loss_dict["router_entropy"] = float(entropy.detach().item())
             loss_dict["router_collapse_kl"] = float(collapse.detach().item())
             probs = router_log_probs.exp().detach().mean(0)
             for i, name in enumerate(enabled):
                 loss_dict[f"router_p_{name}"] = float(probs[i].item())
+                # Fraction of the batch actually routed to each stream.
+                loss_dict[f"router_pick_{name}"] = float(
+                    (modality_choices == i).float().mean().item()
+                )
+            self._router_tick()
 
         return loss_total, loss_dict
 
@@ -1105,12 +1560,13 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         latents_video: dict[str, torch.Tensor],
         *,
         tiled: bool,
+        streams: Optional[Sequence[str]] = None,
     ) -> dict[str, Any]:
-        decoded = {
-            name: self._decode_latents(latents_video[name], tiled=tiled)
-            for name in self._enabled_streams()
-        }
-        decoded["video"] = decoded["rgb"]
+        """Decode ``streams`` (default: all enabled). ``video`` = rgb if decoded, else the
+        first decoded stream."""
+        names = tuple(streams) if streams is not None else self._enabled_streams()
+        decoded = {name: self._decode_latents(latents_video[name], tiled=tiled) for name in names}
+        decoded["video"] = decoded["rgb"] if "rgb" in decoded else decoded[names[0]]
         return decoded
 
     def _run_multistream_infer_loop(
@@ -1127,7 +1583,10 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         action_condition: Optional[torch.Tensor],
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
+        update_streams: Optional[Sequence[str]] = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """``update_streams``: only these futures are denoised (stepped); the others stay
+        in the MoT as their initial noise. ``None`` = step every future in the layout."""
         action_attend_mode = self._validate_action_attend_mode(action_attend_mode)
         if active_future is None:
             video_keys = self._enabled_streams()
@@ -1174,6 +1633,8 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
                 active_future=active_future,
             )
             for name, pred in pred_video.items():
+                if update_streams is not None and name not in update_streams:
+                    continue  # inactive future: present in the MoT, never denoised
                 latents_video[name] = self.infer_video_scheduler.step(
                     pred, step_delta_video, latents_video[name]
                 )
@@ -1266,6 +1727,7 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         compile_action_infer: bool = False,
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
+        prompt_text: Optional[str] = None,
     ) -> dict[str, Any]:
         del compile_action_infer, negative_prompt, text_cfg_scale
         self.eval()
@@ -1306,19 +1768,27 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         )
         if active_future is not None:
             logger.info("infer_action active_future=%s", active_future)
-        _, latents_action = self._run_multistream_infer_loop(
-            latents_video=latents_video,
-            latents_action=latents_action,
-            first_frames=first_frames,
-            fuse_flag=fuse_flag,
-            context=context,
-            context_mask=context_mask,
-            num_inference_steps=num_inference_steps,
-            sigma_shift=sigma_shift,
-            action_condition=None,
-            action_attend_mode=action_attend_mode,
-            active_future=active_future,
-        )
+            context, context_mask = self._infer_modality_context(
+                context, context_mask, active_future, prompt=prompt, proprio=proprio, prompt_text=prompt_text
+            )
+        elif getattr(self, "modality_prompt", False):
+            logger.warning("infer_action: modality_prompt is on but no stream was chosen; running without it.")
+        gate, loop_future, update_streams = self._infer_layout(active_future, action_attend_mode)
+        with gate:
+            _, latents_action = self._run_multistream_infer_loop(
+                latents_video=latents_video,
+                latents_action=latents_action,
+                first_frames=first_frames,
+                fuse_flag=fuse_flag,
+                context=context,
+                context_mask=context_mask,
+                num_inference_steps=num_inference_steps,
+                sigma_shift=sigma_shift,
+                action_condition=None,
+                action_attend_mode=action_attend_mode,
+                active_future=loop_future,
+                update_streams=update_streams,
+            )
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
             "action_attend_mode": action_attend_mode,
@@ -1347,6 +1817,7 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         compile_action_infer: bool = False,
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
+        prompt_text: Optional[str] = None,
     ) -> dict[str, Any]:
         del compile_action_infer, negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
@@ -1397,22 +1868,38 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         )
         if active_future is not None:
             logger.info("infer_joint active_future=%s", active_future)
-        latents_video, latents_action = self._run_multistream_infer_loop(
-            latents_video=latents_video,
-            latents_action=latents_action,
-            first_frames=first_frames,
-            fuse_flag=fuse_flag,
-            context=context,
-            context_mask=context_mask,
-            num_inference_steps=num_inference_steps,
-            sigma_shift=sigma_shift,
-            action_condition=action,
-            action_attend_mode=action_attend_mode,
-            active_future=active_future,
-        )
-        decoded = self._decode_stream_videos(latents_video, tiled=tiled)
+            context, context_mask = self._infer_modality_context(
+                context, context_mask, active_future, prompt=prompt, proprio=proprio, prompt_text=prompt_text
+            )
+        elif getattr(self, "modality_prompt", False):
+            logger.warning("infer_joint: modality_prompt is on but no stream was chosen; running without it.")
+        gate, loop_future, update_streams = self._infer_layout(active_future, action_attend_mode)
+        with gate:
+            latents_video, latents_action = self._run_multistream_infer_loop(
+                latents_video=latents_video,
+                latents_action=latents_action,
+                first_frames=first_frames,
+                fuse_flag=fuse_flag,
+                context=context,
+                context_mask=context_mask,
+                num_inference_steps=num_inference_steps,
+                sigma_shift=sigma_shift,
+                action_condition=action,
+                action_attend_mode=action_attend_mode,
+                active_future=loop_future,
+                update_streams=update_streams,
+            )
+        # Decode only the futures that were actually denoised: with a chosen stream that is
+        # just that stream (short: the others are not in the MoT; full: never stepped).
+        if update_streams is not None:
+            denoised = tuple(update_streams)
+        elif active_future is not None:
+            denoised = (active_future,)
+        else:
+            denoised = self._enabled_streams()
+        decoded = self._decode_stream_videos(latents_video, tiled=tiled, streams=denoised)
         return {
-            "video": decoded["rgb"],
+            "video": decoded[active_future] if active_future is not None else decoded["video"],
             "video_rgb": decoded.get("rgb"),
             "video_depth": decoded.get("depth"),
             "video_flow": decoded.get("flow"),
@@ -1441,6 +1928,7 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
         rand_device: str = "cpu",
         tiled: bool = False,
         action_attend_mode: str = "all",
+        prompt_text: Optional[str] = None,
     ) -> dict[str, Any]:
         del action_cfg_scale
         if action_horizon is None:
@@ -1462,6 +1950,7 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             rand_device=rand_device,
             tiled=tiled,
             action_attend_mode=action_attend_mode,
+            prompt_text=prompt_text,
         )
 
     def save_checkpoint(self, path, optimizer=None, step=None):
@@ -1493,4 +1982,8 @@ class FastWAMJointMultimodalSelect(FastWAMJointMultimodal):
             logger.warning(
                 "Checkpoint contains `modality_router` but current model has none; ignoring."
             )
+        step = payload.get("step") if isinstance(payload, dict) else None
+        if step is not None:
+            # Resume the warm-up clock where the checkpoint left off.
+            self._router_calls = int(step) * int(getattr(self, "router_grad_accum", 1))
         return payload

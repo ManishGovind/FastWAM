@@ -4,9 +4,14 @@ Features match FastWAM training MoT inputs (no extra pooling):
 
 * ``r0`` — full first latent frame flattened ``[B, C*H*W]``
 * ``context`` — full text+proprio token sequence ``[B, L, D]``
-  (optional ``context_mask`` zeros pad tokens before the projection)
+  (optional ``context_mask`` zeros pad tokens *after* the per-token projection)
 
-Architecture matches ``notebooks/train_modality_router.ModalityRouter``.
+Inline (in-graph) router used by ``fastwam_joint_multimodal_select_new``.
+Differences from ``modality_router.py``:
+
+* Pad tokens are masked after ``context_proj``. Masking before it does not remove
+  them: LayerNorm maps a zero vector to its bias, so every pad token still
+  contributed ``Linear(beta)`` to the head input.
 """
 
 from __future__ import annotations
@@ -83,13 +88,25 @@ class ModalityRouter(nn.Module):
                 f"`context` must be [B, {self.context_len}, {self.context_dim}], "
                 f"got {tuple(context.shape)}"
             )
-        # Zero pad positions so they do not contribute after the linear.
+        # Run in the router's parameter dtype: DeepSpeed bf16 casts the whole model
+        # (router included) to bf16, while callers pass float32 features.
+        param_dtype = self.r0_proj[1].weight.dtype
+        r0 = r0.to(param_dtype)
+        context = context.to(param_dtype)
+        r0_h = self.r0_proj(r0)
+        ctx_h = self.context_proj(context)  # [B, L, d]
+        # Zero pad positions after the projection so they carry no signal
+        # (before it, LayerNorm would turn them into a constant nonzero bias).
         mask: Optional[torch.Tensor] = feats.get("context_mask")
         if mask is not None:
-            context = context * mask.to(dtype=context.dtype).unsqueeze(-1)
-        r0_h = self.r0_proj(r0)
-        ctx_h = self.context_proj(context).flatten(1)  # [B, L*d]
-        return self.head(torch.cat([r0_h, ctx_h], dim=-1))
+            if mask.shape != context.shape[:2]:
+                raise ValueError(
+                    f"`context_mask` must be {tuple(context.shape[:2])}, got {tuple(mask.shape)}"
+                )
+            ctx_h = ctx_h * mask.to(dtype=ctx_h.dtype).unsqueeze(-1)
+        ctx_h = ctx_h.flatten(1)  # [B, L*d]
+        # float32 logits so softmax / sampling / router losses stay in full precision.
+        return self.head(torch.cat([r0_h, ctx_h], dim=-1)).float()
 
     @torch.no_grad()
     def route_offline(self, feats: Mapping[str, torch.Tensor]) -> torch.Tensor:

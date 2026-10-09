@@ -437,6 +437,15 @@ class Wan22Trainer:
                 sample[key], name=key, batch_ndim=2
             )
 
+        # GT modality select: keep oracle label through eval training_loss.
+        if "selected_modality" in sample:
+            sel = sample["selected_modality"]
+            if not isinstance(sel, torch.Tensor):
+                sel = torch.as_tensor(sel)
+            if sel.ndim == 0:
+                sel = sel.view(1)
+            batched["selected_modality"] = sel.long()
+
         return batched
 
     @torch.no_grad()
@@ -484,6 +493,10 @@ class Wan22Trainer:
             infer_kwargs["context_mask"] = sample["context_mask"][0]
         else:
             infer_kwargs["prompt"] = prompt
+        # Models that condition on extra text (e.g. the _new select modality condition) need
+        # the instruction string even when only the cached context is passed.
+        if "prompt_text" in inspect.signature(model.infer).parameters:
+            infer_kwargs["prompt_text"] = prompt
 
         pred = model.infer(
             **infer_kwargs,
@@ -501,8 +514,15 @@ class Wan22Trainer:
             f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
         )
 
-        psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
-        ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+        # Select models may roll out a depth/flow future (``active_future``); comparing that
+        # with the RGB ground truth is meaningless, so those rollout metrics become NaN and
+        # are excluded from the cross-rank mean below.
+        rollout_is_rgb = pred.get("active_future") in (None, "rgb")
+        if rollout_is_rgb:
+            psnr_rollout_vs_gt = video_psnr(pred=pred_video_tensor, target=gt_video_tensor)
+            ssim_rollout_vs_gt = video_ssim(pred=pred_video_tensor, target=gt_video_tensor)
+        else:
+            psnr_rollout_vs_gt = ssim_rollout_vs_gt = float("nan")
 
         action_l1 = None
         action_l2 = None
@@ -573,8 +593,11 @@ class Wan22Trainer:
         psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
         ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
 
-        psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
-        ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
+        if rollout_is_rgb:
+            psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
+            ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
+        else:
+            psnr_rollout_vs_decode = ssim_rollout_vs_decode = float("nan")
 
         stitched_video_tensor = torch.cat(
             [pred_video_tensor, vae_video_tensor, gt_video_tensor],
@@ -602,12 +625,14 @@ class Wan22Trainer:
                 float(ssim_decode_vs_gt),
                 float(action_l2) if action_l2 is not None else -1.0,
                 float(action_l1) if action_l1 is not None else -1.0,
+                float(rollout_is_rgb),
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
         ).unsqueeze(0)
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
-        mean_metrics = gathered_metrics[:, :7].mean(dim=0)
+        mean_metrics = gathered_metrics[:, :7].nanmean(dim=0)  # NaN = non-RGB rollout (see above)
+        rollout_rgb_frac = gathered_metrics[:, 9].mean().item()
         action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
         action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
 
@@ -624,6 +649,10 @@ class Wan22Trainer:
             "ssim_dg": float(mean_metrics[6].item()),
             "video_path": video_path,
         }
+        if "active_future" in pred:
+            # Fraction of eval rollouts (across ranks) that predicted an RGB future; the
+            # psnr/ssim *_rg / *_rd values above average over those rollouts only.
+            result["rollout_rgb_frac"] = float(rollout_rgb_frac)
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)
         if action_l1_mean is not None:
@@ -823,6 +852,8 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l2"] = float(metrics["action_l2"])
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            if "rollout_rgb_frac" in metrics:
+                                eval_payload["eval/rollout_rgb_frac"] = float(metrics["rollout_rgb_frac"])
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:

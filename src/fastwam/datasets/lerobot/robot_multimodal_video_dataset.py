@@ -42,9 +42,12 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         modality_label_path: str | None = None,
         modality_label_frame_stride: int | None = None,
         modality_label_nearest: bool = True,
+        # If true, only decode/pack RGB and emit ``video`` (no video_rgb/depth/flow).
+        rgb_video_only: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.rgb_video_only = bool(rgb_video_only)
 
         if modality_camera_groups is None:
             raise ValueError(
@@ -131,9 +134,10 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
                 )
 
         logger.info(
-            "RobotMultimodalVideoDataset modalities=%s rgb_condition=%s zero_condition=%s "
-            "modality_labels=%s",
+            "RobotMultimodalVideoDataset modalities=%s rgb_video_only=%s rgb_condition=%s "
+            "zero_condition=%s modality_labels=%s",
             {k: v for k, v in self.modality_camera_groups.items()},
+            self.rgb_video_only,
             sorted(self.rgb_condition_modalities),
             sorted(self.zero_condition_modalities),
             modality_label_path or "off",
@@ -219,12 +223,13 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             videos[modality] = self._pack_camera_group(cameras[cam_indices])
 
         video_rgb = videos["rgb"]
-        # Unimodal parity: [RGB_t0, depth/flow_t≥1]
-        for modality in self.rgb_condition_modalities:
-            if modality not in videos:
-                continue
-            videos[modality] = videos[modality].clone()
-            videos[modality][:, 0] = video_rgb[:, 0]
+        if not self.rgb_video_only:
+            # Unimodal parity: [RGB_t0, depth/flow_t≥1]
+            for modality in self.rgb_condition_modalities:
+                if modality not in videos:
+                    continue
+                videos[modality] = videos[modality].clone()
+                videos[modality][:, 0] = video_rgb[:, 0]
 
         action = sample["action"]
         proprio = sample["proprio"][:-1, :]
@@ -254,8 +259,9 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             "proprio_is_pad": sample["proprio_is_pad"],
             "dataset_index": int(sample_idx),
         }
-        for name, video in videos.items():
-            data[f"video_{name}"] = video
+        if not self.rgb_video_only:
+            for name, video in videos.items():
+                data[f"video_{name}"] = video
         if self.use_text_embed_cache:
             context, context_mask = self._get_cached_text_context(instruction)
             context[~context_mask] = 0.0
