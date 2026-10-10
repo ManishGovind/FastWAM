@@ -32,7 +32,9 @@ in ``fastwam_joint_multimodal.py``.
   depth video.")`` -> ``[combined | proprio]``. ``separate``: the condition is encoded alone
   and its tokens are inserted, ``[instruction | condition | proprio]``. Training uses the
   text cache (``scripts/precompute_modality_text_embeds.py``); inference encodes with
-  the loaded text encoder when available;
+  the loaded text encoder when available. ``modality_prompt_target``: ``both`` (default,
+  as in the paper) feeds the conditioned context to both experts; ``video`` feeds it to
+  the video expert only, and the action expert keeps ``[instruction | proprio]``;
 * ``router_layout`` (default ``short``): ``short`` builds only ``[R0 | chosen future | A]``;
   ``full`` builds the MM layout ``[R0 | R_fut | D_fut | F_fut | A]`` and a per-sample
   one-hot mask lets the action attend only R0 + the chosen future.
@@ -82,6 +84,7 @@ DEFAULT_MODALITY_SENTENCES = {
     "flow": "Predict the flow video.",
 }
 MODALITY_PROMPT_MODES = ("joint", "separate")
+MODALITY_PROMPT_TARGETS = ("both", "video")
 
 class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
     """Like FastWAMJointMultimodal, with modality_select=random|gt|router|all."""
@@ -111,6 +114,11 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         modality_prompt_context_len = int(kwargs.pop("modality_prompt_context_len", 128))
         modality_prompt_enc_id = str(kwargs.pop("modality_prompt_enc_id", "wan22ti2v5b"))
         modality_prompt_mode = str(kwargs.pop("modality_prompt_mode", "joint")).lower()
+        modality_prompt_target = str(kwargs.pop("modality_prompt_target", "both")).lower()
+        if modality_prompt_target not in MODALITY_PROMPT_TARGETS:
+            raise ValueError(
+                f"`modality_prompt_target` must be one of {MODALITY_PROMPT_TARGETS}, got {modality_prompt_target!r}"
+            )
         if modality_prompt_mode not in MODALITY_PROMPT_MODES:
             raise ValueError(
                 f"`modality_prompt_mode` must be one of {MODALITY_PROMPT_MODES}, got {modality_prompt_mode!r}"
@@ -161,6 +169,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model._action_stream_log_gate = None
         model.modality_prompt = modality_prompt
         model.modality_prompt_mode = modality_prompt_mode
+        model.modality_prompt_target = modality_prompt_target
         model.modality_prompt_sentences = dict(DEFAULT_MODALITY_SENTENCES)
         if modality_prompt_sentences:
             model.modality_prompt_sentences.update(
@@ -200,7 +209,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             "FastWAMJointMultimodalSelectNew streams=%s modality_select=%s "
             "router_T=%.3f entropy=%.4f collapse_kl=%.4f reward=%s baseline=%s "
             "(bins=%d momentum=%.3f) adv_normalize=%s warmup_steps=%d (grad_accum=%d) "
-            "layout=%s video_loss=%s modality_prompt=%s (%s) "
+            "layout=%s video_loss=%s modality_prompt=%s (%s, target=%s) "
             "loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
             list(model.enabled_video_streams),
             model.modality_select,
@@ -218,6 +227,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             model.router_video_loss,
             model.modality_prompt,
             model.modality_prompt_mode,
+            model.modality_prompt_target,
             model.loss_lambda_rgb,
             model.loss_lambda_depth,
             model.loss_lambda_flow,
@@ -621,6 +631,17 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         mhead, mtail = context_mask[:, : context.shape[1] - n_tail], context_mask[:, context.shape[1] - n_tail :]
         return torch.cat([head, tok, tail], dim=1), torch.cat([mhead, msk, mtail], dim=1)
 
+    def _action_side_context(
+        self,
+        plain_context: torch.Tensor,
+        plain_context_mask: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Context for the action expert: ``None`` = same as the video expert; with
+        ``modality_prompt_target=video`` the plain ``[instruction | proprio]``."""
+        if getattr(self, "modality_prompt", False) and getattr(self, "modality_prompt_target", "both") == "video":
+            return plain_context, plain_context_mask
+        return None, None
+
     def _infer_modality_context(
         self,
         context: torch.Tensor,
@@ -918,8 +939,13 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         action_condition: Optional[torch.Tensor] = None,
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
+        action_context: Optional[torch.Tensor] = None,
+        action_context_mask: Optional[torch.Tensor] = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Joint denoise over multistream MoT.
+
+        ``action_context``: text context for the action expert's cross-attention
+        (default: the same ``context`` as the video expert).
 
         ``active_future=None``: all ``enabled_video_streams`` futures in MoT
         (training default when ``modality_select=all``, and inference).
@@ -1063,7 +1089,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             [mot_parts[n]["context_mask"] for n in mot_streams], dim=1
         )
         context_video = mot_parts["rgb"]["context"]
-
+        
+        
         (
             action_tokens,
             _t_action,
@@ -1074,8 +1101,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         ) = self.action_expert.prepare(
             action_tokens=latents_action,
             timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            context=context if action_context is None else action_context,
+            context_mask=context_mask if action_context is None else action_context_mask,
         )
 
         stream_seq_lens = [int(mot_parts[n]["tokens"].shape[1]) for n in mot_streams]
@@ -1214,6 +1241,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # MoT context: instruction (+ chosen modality sentence) + proprio. The router above
         # saw the context without the sentence.
         ctx_mot, ctx_mask_mot = context, context_mask
+        act_ctx, act_ctx_mask = self._action_side_context(context, context_mask)
         if modality_choices is not None:
             prompts = sample.get("prompt")
             if isinstance(prompts, str):
@@ -1283,6 +1311,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                     fuse_vae_embedding_in_latents=fuse_flag,
                     action_condition=action_cond,
                     active_future=None if sub_choices is not None else active_future,
+                    action_context=None if act_ctx is None else act_ctx.index_select(0, idx),
+                    action_context_mask=self._slice_batch(act_ctx_mask, idx),
                 )
 
             video_names = (
@@ -1584,6 +1614,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
         update_streams: Optional[Sequence[str]] = None,
+        action_context: Optional[torch.Tensor] = None,
+        action_context_mask: Optional[torch.Tensor] = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """``update_streams``: only these futures are denoised (stepped); the others stay
         in the MoT as their initial noise. ``None`` = step every future in the layout."""
@@ -1631,6 +1663,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 action_condition=action_condition,
                 action_attend_mode=action_attend_mode,
                 active_future=active_future,
+                action_context=action_context,
+                action_context_mask=action_context_mask,
             )
             for name, pred in pred_video.items():
                 if update_streams is not None and name not in update_streams:
@@ -1682,7 +1716,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         """Pick MoT future stream for infer — same contract as training ``active_future``.
 
         Priority:
-          1. Explicit ``active_future`` in {rgb, depth, flow}
+          1. Explicit ``active_future`` in {rgb, depth, flow}, or ``random`` (uniform per call)
              (``all`` / ``none`` / empty → all enabled futures, same as ``None``)
           2. Learned router when ``modality_select=router`` and attend mode is ``all``
           3. ``None`` → all enabled futures in MoT
@@ -1692,6 +1726,11 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             if active in ("", "all", "none", "null"):
                 return None
             enabled = self._enabled_streams()
+            if active == "random":
+                # Uniform random stream per inference call (= per replan), as in training.
+                chosen = enabled[int(torch.randint(len(enabled), (1,)).item())]
+                logger.info("Random active_future=%s", chosen)
+                return chosen
             if active not in enabled:
                 raise ValueError(
                     f"`active_future`={active!r} must be one of {enabled} or 'all'"
@@ -1705,6 +1744,11 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             )
             logger.info("Router selected active_future=%s", chosen)
             return chosen
+        if getattr(self, "modality_prompt", False) and getattr(self, "modality_select", "all") in ("random", "gt"):
+            # Trained on one conditioned stream per sample; "all futures, no condition" was
+            # never seen. Default to rgb when no stream is given (e.g. the trainer's eval).
+            logger.info("No active_future given with modality_prompt on; defaulting to rgb.")
+            return "rgb"
         return None
 
     @torch.no_grad()
@@ -1766,6 +1810,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             context=context,
             context_mask=context_mask,
         )
+        plain_context, plain_context_mask = context, context_mask
         if active_future is not None:
             logger.info("infer_action active_future=%s", active_future)
             context, context_mask = self._infer_modality_context(
@@ -1788,6 +1833,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 action_attend_mode=action_attend_mode,
                 active_future=loop_future,
                 update_streams=update_streams,
+                action_context=self._action_side_context(plain_context, plain_context_mask)[0],
+                action_context_mask=self._action_side_context(plain_context, plain_context_mask)[1],
             )
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
@@ -1866,6 +1913,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             context=context,
             context_mask=context_mask,
         )
+        plain_context, plain_context_mask = context, context_mask
         if active_future is not None:
             logger.info("infer_joint active_future=%s", active_future)
             context, context_mask = self._infer_modality_context(
@@ -1888,6 +1936,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 action_attend_mode=action_attend_mode,
                 active_future=loop_future,
                 update_streams=update_streams,
+                action_context=self._action_side_context(plain_context, plain_context_mask)[0],
+                action_context_mask=self._action_side_context(plain_context, plain_context_mask)[1],
             )
         # Decode only the futures that were actually denoised: with a chosen stream that is
         # just that stream (short: the others are not in the MoT; full: never stepped).

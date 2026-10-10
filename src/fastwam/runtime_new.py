@@ -46,6 +46,7 @@ def create_fastwam_joint_multimodal_select_new(
     modality_prompt_context_len: int = 128,
     modality_prompt_enc_id: str = "wan22ti2v5b",
     modality_prompt_mode: str = "joint",
+    modality_prompt_target: str = "both",
     mot_checkpoint_mixed_attn: bool = False,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -153,6 +154,7 @@ def create_fastwam_joint_multimodal_select_new(
         modality_prompt_context_len=int(modality_prompt_context_len),
         modality_prompt_enc_id=str(modality_prompt_enc_id),
         modality_prompt_mode=str(modality_prompt_mode),
+        modality_prompt_target=str(modality_prompt_target),
         **(_extra_kwargs or {}),
     )
 
