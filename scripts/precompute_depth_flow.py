@@ -56,6 +56,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("precompute_depth_flow")
 
 # RGB source -> depth / flow output keys
+#Libero
 DEFAULT_CAMERA_STREAMS = (
     {
         "source_key": "observation.images.image",
@@ -68,6 +69,23 @@ DEFAULT_CAMERA_STREAMS = (
         "flow_key": "observation.images.wrist_flow",
     },
 )
+# DEFAULT_CAMERA_STREAMS = (
+#     {
+#         "source_key": "observation.images.image",
+#         "depth_key": "observation.images.depth",
+#         "flow_key": "observation.images.flow",
+#     },
+#     {
+#         "source_key": "observation.images.wrist_left_image",
+#         "depth_key": "observation.images.wrist_left_depth",
+#         "flow_key": "observation.images.wrist_left_flow",
+#     },
+#     {
+#         "source_key": "observation.images.wrist_right_image",
+#         "depth_key": "observation.images.wrist_right_depth",
+#         "flow_key": "observation.images.wrist_right_flow",
+#     },
+# )
 
 # Official Depth Anything V2 (https://github.com/DepthAnything/Depth-Anything-V2)
 DEPTH_ANYTHING_V2_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "Depth-Anything-V2"
