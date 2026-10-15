@@ -176,7 +176,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.use_stream_embedding = stream_embedding
         if stream_embedding:
             model.video_expert.stream_embedding = torch.nn.Parameter(
-                torch.zeros(len(_STREAM_KEYS), model.video_expert.hidden_dim, device=model.device, dtype=model.torch_dtype)
+                torch.randn(len(_STREAM_KEYS), model.video_expert.hidden_dim, device=model.device, dtype=model.torch_dtype) * 0.02
             )
         model.modality_prompt_sentences = dict(DEFAULT_MODALITY_SENTENCES)
         if modality_prompt_sentences:
