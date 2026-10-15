@@ -115,6 +115,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         modality_prompt_enc_id = str(kwargs.pop("modality_prompt_enc_id", "wan22ti2v5b"))
         modality_prompt_mode = str(kwargs.pop("modality_prompt_mode", "joint")).lower()
         modality_prompt_target = str(kwargs.pop("modality_prompt_target", "both")).lower()
+        stream_embedding = bool(kwargs.pop("stream_embedding", False))
         if modality_prompt_target not in MODALITY_PROMPT_TARGETS:
             raise ValueError(
                 f"`modality_prompt_target` must be one of {MODALITY_PROMPT_TARGETS}, got {modality_prompt_target!r}"
@@ -170,6 +171,13 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.modality_prompt = modality_prompt
         model.modality_prompt_mode = modality_prompt_mode
         model.modality_prompt_target = modality_prompt_target
+        # Learned per-stream identity on the adaLN timestep embedding (see _joint_denoise_multistream).
+        # On video_expert -> inside model.mot -> trained + checkpointed. Zero-init = exact no-op.
+        model.use_stream_embedding = stream_embedding
+        if stream_embedding:
+            model.video_expert.stream_embedding = torch.nn.Parameter(
+                torch.zeros(len(_STREAM_KEYS), model.video_expert.hidden_dim, device=model.device, dtype=model.torch_dtype)
+            )
         model.modality_prompt_sentences = dict(DEFAULT_MODALITY_SENTENCES)
         if modality_prompt_sentences:
             model.modality_prompt_sentences.update(
@@ -1016,6 +1024,13 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 action=action_condition,
                 fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
             )
+            if getattr(self, "use_stream_embedding", False):
+                # Stream identity (DiT class-conditioning style): add a learned per-stream vector
+                # to the timestep embedding of this stream's FUTURE tokens (R0 / frame 0 untouched),
+                # then rebuild the adaLN modulation. Keyed by stream name -> short == full layout.
+                s_emb = self.video_expert.stream_embedding[_STREAM_KEYS.index(name)].to(t_video.dtype)
+                t_video = torch.cat([t_video[:, :tokens_per_frame], t_video[:, tokens_per_frame:] + s_emb], dim=1)
+                t_mod_video = self.video_expert.time_projection(t_video).unflatten(2, (6, self.video_expert.hidden_dim))
             prepared[name] = {
                 "tokens": video_tokens,
                 "t": t_video,
