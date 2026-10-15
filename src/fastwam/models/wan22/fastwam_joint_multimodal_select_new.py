@@ -582,13 +582,23 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             Path(self._modality_prompt_cache_dir)
             / f"{hashed}.t5_len{self._modality_prompt_context_len}.{self._modality_prompt_enc_id}.pt"
         )
-        if not path.is_file():
+        if path.is_file():
+            payload = torch.load(path, map_location="cpu")
+            hit = (payload["context"], payload["mask"].bool())
+        elif getattr(self, "text_encoder", None) is not None and getattr(self, "tokenizer", None) is not None:
+            # Not cached (e.g. an eval instruction outside the training set): encode it the way
+            # the cache was made -- raw T5 output with the real padding mask. Not
+            # `encode_prompt`, which zeroes the padding and makes it visible (all-ones mask).
+            logger.info("Joint modality prompt not cached; encoding online: %r", text)
+            ids, mask = self.tokenizer(text, return_mask=True, add_special_tokens=True)
+            mask = mask.to(self.device, dtype=torch.bool)
+            ctx = self.text_encoder(ids.to(self.device), mask)
+            hit = (ctx[0].detach().to("cpu", torch.bfloat16), mask[0].cpu())
+        else:
             raise FileNotFoundError(
                 f"Missing joint modality prompt cache {path} for {text!r}. Run "
                 "`python scripts/precompute_modality_text_embeds.py task=<task>`."
             )
-        payload = torch.load(path, map_location="cpu")
-        hit = (payload["context"], payload["mask"].bool())
         self._joint_prompt_cache[text] = hit
         return hit
 
@@ -659,11 +669,11 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         """
         if not getattr(self, "modality_prompt", False):
             return context, context_mask
-        if self.modality_prompt_mode == "joint" and prompt is not None and getattr(self, "text_encoder", None) is not None:
-            # Eval path: encode instruction + condition together, then append proprio as usual.
-            return self._resolve_infer_context(
-                prompt=self._joint_prompt_text(prompt, stream), proprio=proprio, context=None, context_mask=None
-            )
+        # Same code path as training: swap the instruction tokens of the plain context for the
+        # joint "<instruction> Predict the X video." tokens (cache, or online with the same
+        # padding mask), keeping the proprio token. Re-encoding with `encode_prompt` would make
+        # the zeroed padding visible, which training never saw for the joint prompt.
+        del proprio
         text = prompt if prompt is not None else prompt_text
         return self._modality_prompt_context(
             context, context_mask, [stream], prompts=None if text is None else [text]
@@ -1089,7 +1099,6 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             [mot_parts[n]["context_mask"] for n in mot_streams], dim=1
         )
         context_video = mot_parts["rgb"]["context"]
-        
         
         (
             action_tokens,
@@ -1726,9 +1735,16 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             if active in ("", "all", "none", "null"):
                 return None
             enabled = self._enabled_streams()
-            if active == "random":
+            if active == "random" or active.startswith("random:"):
                 # Uniform random stream per inference call (= per replan), as in training.
-                chosen = enabled[int(torch.randint(len(enabled), (1,)).item())]
+                # "random:depth,rgb" restricts the draw to the listed streams.
+                pool = enabled
+                if active.startswith("random:"):
+                    pool = tuple(s.strip() for s in active.split(":", 1)[1].split(",") if s.strip())
+                    bad = [s for s in pool if s not in enabled]
+                    if not pool or bad:
+                        raise ValueError(f"`active_future`={active!r}: streams must be a subset of {enabled}")
+                chosen = pool[int(torch.randint(len(pool), (1,)).item())]
                 logger.info("Random active_future=%s", chosen)
                 return chosen
             if active not in enabled:
