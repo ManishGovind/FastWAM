@@ -31,7 +31,12 @@ from experiments.libero_plus.libero_plus_utils import (
 bootstrap_libero_plus(project_root)
 
 from experiments.libero.action_ensembler import ActionEnsembler
-from experiments.libero.eval_infer import call_action_infer, validate_eval_infer_model
+from experiments.libero.eval_infer import (
+    apply_per_task_active_future,
+    call_action_infer,
+    plus_base_task,
+    validate_eval_infer_model,
+)
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
     get_libero_dummy_action,
@@ -412,6 +417,12 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    action_attend_mode = cfg.EVALUATION.get("action_attend_mode", None)
+    if action_attend_mode is not None:
+        infer_kwargs["action_attend_mode"] = str(action_attend_mode)
+    active_future = cfg.EVALUATION.get("active_future", None)
+    if active_future is not None and str(active_future).strip() != "":
+        infer_kwargs["active_future"] = str(active_future).lower()
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -444,6 +455,7 @@ def _predict_action_chunk(
                 model,
                 infer_kwargs,
                 compile_action_infer=compile_action_infer,
+                cfg=cfg,
             )
     action = pred["action"]  # [T, D]
 
@@ -750,6 +762,8 @@ def _run_task_to_file(
 
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
     task = task_suite.get_task(task_id)
+    # Optional per-task stream: JSON {suite: {base_task_name or task_id: stream}}.
+    apply_per_task_active_future(task_cfg, suite_name, [plus_base_task(task.name), str(task_id)])
     initial_states = load_task_init_states(task_suite, task_id)
     while len(initial_states) < int(task_cfg.EVALUATION.num_trials):
         initial_states.extend(
@@ -769,6 +783,7 @@ def _run_task_to_file(
         "task_id": task_id,
         "task_name": task.name,
         "task_description": None,
+        "active_future": task_cfg.EVALUATION.get("active_future", None),
         "successes": 0,
         "total_episodes": int(task_cfg.EVALUATION.num_trials),
         "gpu_id": int(task_cfg.gpu_id),
@@ -906,7 +921,11 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
-    validate_eval_infer_model(model)
+    validate_eval_infer_model(
+        model,
+        action_attend_mode=cfg.EVALUATION.get("action_attend_mode", None),
+        active_future=cfg.EVALUATION.get("active_future", None),
+    )
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))

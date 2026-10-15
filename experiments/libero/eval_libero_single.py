@@ -24,7 +24,11 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from experiments.libero.eval_infer import call_action_infer, validate_eval_infer_model
+from experiments.libero.eval_infer import (
+    apply_per_task_active_future,
+    call_action_infer,
+    validate_eval_infer_model,
+)
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
     get_libero_dummy_action,
@@ -409,6 +413,9 @@ def _predict_action_chunk(
     action_attend_mode = cfg.EVALUATION.get("action_attend_mode", None)
     if action_attend_mode is not None:
         infer_kwargs["action_attend_mode"] = str(action_attend_mode)
+    active_future = cfg.EVALUATION.get("active_future", None)
+    if active_future is not None and str(active_future).strip() != "":
+        infer_kwargs["active_future"] = str(active_future).lower()
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -741,6 +748,8 @@ def _run_task_to_file(
     task_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     task_cfg.EVALUATION.task_suite_name = suite_name
     task_cfg.EVALUATION.task_id = int(task_id)
+    # Optional per-task stream (EVALUATION.active_future_per_task = JSON {suite: {task_id: stream}}).
+    # apply_per_task_active_future(task_cfg, suite_name, [str(task_id)])
 
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
     task = task_suite.get_task(task_id)
@@ -773,6 +782,7 @@ def _run_task_to_file(
         "failure_episodes": [],
         "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "duration": 0,
+        "active_future": task_cfg.EVALUATION.get("active_future", None),
     }
     if worker_id is not None:
         results["worker_id"] = worker_id
