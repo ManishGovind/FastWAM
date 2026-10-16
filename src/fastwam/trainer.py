@@ -507,6 +507,13 @@ class Wan22Trainer:
 
         # 3. inference metrics against GT video
         pred_video_tensor = pil_frames_to_video_tensor(pred_video)
+        # Multistream models: every decoded future slot (a stream that was not denoised,
+        # e.g. the router's unchosen ones, is None and skipped). Others: just `video`.
+        pred_stream_tensors = [
+            pil_frames_to_video_tensor(pred[key])
+            for key in ("video_rgb", "video_depth", "video_flow")
+            if pred.get(key) is not None
+        ] or [pred_video_tensor]
         gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
 
         assert pred_video_tensor.shape == gt_video_tensor.shape, (
@@ -599,8 +606,9 @@ class Wan22Trainer:
         else:
             psnr_rollout_vs_decode = ssim_rollout_vs_decode = float("nan")
 
+        # Rows (top -> bottom): decoded rgb / depth / flow slots, VAE reconstruction, GT.
         stitched_video_tensor = torch.cat(
-            [pred_video_tensor, vae_video_tensor, gt_video_tensor],
+            [*pred_stream_tensors, vae_video_tensor, gt_video_tensor],
             dim=2,
         ).contiguous()
         stitched_frames = []
