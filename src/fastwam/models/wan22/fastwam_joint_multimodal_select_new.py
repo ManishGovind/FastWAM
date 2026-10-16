@@ -65,7 +65,7 @@ from .fastwam_joint_multimodal import (
     FastWAMJointMultimodal,
     _STREAM_KEYS,
 )
-from .modality_router_new import ModalityRouter, collapse_kl
+from .modality_router_new import EmbedModalityRouter, ModalityRouter, collapse_kl
 
 logger = get_logger(__name__)
 
@@ -116,6 +116,11 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         modality_prompt_mode = str(kwargs.pop("modality_prompt_mode", "joint")).lower()
         modality_prompt_target = str(kwargs.pop("modality_prompt_target", "both")).lower()
         stream_embedding = bool(kwargs.pop("stream_embedding", False))
+        # Router input: "raw" = flattened R0 VAE latent + T5/proprio tokens (ModalityRouter);
+        # "embed" = the video expert's own patch/text embeddings, shared + detached (EmbedModalityRouter).
+        router_input = str(kwargs.pop("router_input", "raw")).lower()
+        if router_input not in ("raw", "embed"):
+            raise ValueError(f"`router_input` must be 'raw' or 'embed', got {router_input!r}")
         if modality_prompt_target not in MODALITY_PROMPT_TARGETS:
             raise ValueError(
                 f"`modality_prompt_target` must be one of {MODALITY_PROMPT_TARGETS}, got {modality_prompt_target!r}"
@@ -165,6 +170,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model._router_calls = 0
         model.router_layout = router_layout
         model.router_video_loss = router_video_loss
+        model.router_input = router_input
         # Per-sample [B, K] additive gate on (action rows, future cols); see
         # _build_multistream_mot_attention_mask / _action_stream_gate.
         model._action_stream_log_gate = None
@@ -172,7 +178,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.modality_prompt_mode = modality_prompt_mode
         model.modality_prompt_target = modality_prompt_target
         # Learned per-stream identity on the adaLN timestep embedding (see _joint_denoise_multistream).
-        # On video_expert -> inside model.mot -> trained + checkpointed. Zero-init = exact no-op.
+        # On video_expert -> inside model.mot -> trained + checkpointed. Small random init (0.02).
         model.use_stream_embedding = stream_embedding
         if stream_embedding:
             model.video_expert.stream_embedding = torch.nn.Parameter(
@@ -254,6 +260,15 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
     ) -> ModalityRouter:
         """Build router over full training R0 map + full MoT context sequence."""
         enabled = model._enabled_streams()
+        if getattr(model, "router_input", "raw") == "embed":
+            if getattr(model, "proprio_encoder", None) is None:
+                raise ValueError("router_input=embed expects the proprio token as the last context token.")
+            router = EmbedModalityRouter(
+                dim=int(model.video_expert.hidden_dim), num_classes=len(enabled), hidden=hidden, dropout=dropout,
+            ).to(device=model.device, dtype=torch.float32)
+            logger.info("Built EmbedModalityRouter classes=%s dim=%d (expert patch/text embeddings, "
+                        "attention-pooled R0 + mean text + proprio)", list(enabled), router.dim)
+            return router
         z_dim = 48
         vae = getattr(model, "vae", None)
         if vae is not None and hasattr(vae, "model") and hasattr(vae.model, "z_dim"):
@@ -451,6 +466,16 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             raise ValueError(f"`r0_latent` must be [B,C,H,W], got {tuple(r0_latent.shape)}")
         if context.ndim != 3:
             raise ValueError(f"`context` must be [B,L,D], got {tuple(context.shape)}")
+        if getattr(self, "router_input", "raw") == "embed":
+            # Exactly what the video expert sees: R0 patch tokens (= rgb video_tokens[:, :tpf]) and
+            # text_embedding(context) (= context_video). no_grad: router losses never reach the expert.
+            ve = self.video_expert
+            dtype = ve.patch_embedding.weight.dtype
+            with torch.no_grad():
+                r0 = ve.patch_embedding(r0_latent.unsqueeze(2).to(dtype)).flatten(2).transpose(1, 2)
+                ctx = ve.text_embedding(context.to(dtype))
+            mask = context_mask.bool()
+            return {"r0": r0, "text": ctx[:, :-1], "text_mask": mask[:, :-1], "proprio": ctx[:, -1]}
         r0 = r0_latent.detach().float().flatten(1)
         ctx = context.detach().float()
         mask = context_mask.bool()

@@ -126,6 +126,45 @@ class ModalityRouter(nn.Module):
         return chosen, dist.log_prob(chosen)
 
 
+class EmbedModalityRouter(nn.Module):
+    """Router on the video expert's own input embeddings (computed shared + detached by the caller).
+
+    * ``r0``      ``[B, N, D]`` — ``video_expert.patch_embedding(R0)`` tokens, attention-pooled
+    * ``text``    ``[B, L, D]`` — ``video_expert.text_embedding(T5)`` tokens, masked mean
+    * ``proprio`` ``[B, D]``    — ``video_expert.text_embedding`` of the proprio token
+    Each -> ``d``, concat -> MLP head. ``last_attn`` keeps the R0 pooling weights for analysis.
+    """
+
+    def __init__(self, *, dim: int, num_classes: int, d: int = 128, hidden: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_classes = int(num_classes)
+        self.r0_proj = nn.Sequential(nn.LayerNorm(self.dim), nn.Linear(self.dim, d))
+        self.q = nn.Parameter(torch.randn(d) / d**0.5)  # learned pooling query
+        self.text_proj = nn.Sequential(nn.LayerNorm(self.dim), nn.Linear(self.dim, d))
+        self.proprio_proj = nn.Sequential(nn.LayerNorm(self.dim), nn.Linear(self.dim, d))
+        self.head = nn.Sequential(
+            nn.SiLU(), nn.Dropout(dropout), nn.Linear(3 * d, hidden),
+            nn.SiLU(), nn.Dropout(dropout), nn.Linear(hidden, self.num_classes),
+        )
+        for linear in (self.r0_proj[1], self.text_proj[1], self.proprio_proj[1], self.head[2], self.head[5]):
+            nn.init.kaiming_normal_(linear.weight, nonlinearity="relu")
+            nn.init.zeros_(linear.bias)
+        self.last_attn: Optional[torch.Tensor] = None
+
+    def forward(self, feats: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        dtype = self.q.dtype
+        h = self.r0_proj(feats["r0"].to(dtype))                              # [B, N, d]
+        w = torch.softmax(h @ self.q / h.shape[-1] ** 0.5, dim=1)            # [B, N]
+        self.last_attn = w.detach()
+        r0 = (w.unsqueeze(-1) * h).sum(1)                                    # [B, d]
+        m = feats["text_mask"].to(dtype).unsqueeze(-1)                       # [B, L, 1]
+        text = (feats["text"].to(dtype) * m).sum(1) / m.sum(1).clamp_min(1.0)
+        text = self.text_proj(text)                                          # [B, d]
+        proprio = self.proprio_proj(feats["proprio"].to(dtype))              # [B, d]
+        return self.head(torch.cat([r0, text, proprio], dim=-1)).float()
+
+
 def collapse_kl(logits: torch.Tensor) -> torch.Tensor:
     """KL(Uniform || batch-mean softmax). Penalizes collapse to a single modality."""
     p_bar = F.softmax(logits, dim=-1).mean(0).clamp_min(1e-8)
