@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 import numpy as np
 import torch
+import torchvision.transforms.functional as transforms_F
 from omegaconf import DictConfig, OmegaConf
 
 from fastwam.utils.logging_config import get_logger
@@ -170,10 +171,19 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         """cameras: [N_cam, T, C, H, W] -> [C, T, H', W'] in [-1, 1]."""
         num_cameras, t_video, _, _, _ = cameras.shape
         if self.concat_multi_camera == "robotwin":
-            raise ValueError(
-                "RobotMultimodalVideoDataset does not support concat_multi_camera='robotwin'."
-            )
-        if num_cameras > 1:
+            # Same 3-camera tile as RobotVideoDataset, per modality group:
+            # head [256, 320] on top, left | right wrist [128, 160] each below -> [384, 320].
+            if num_cameras != 3:
+                raise ValueError(
+                    f"`concat_multi_camera='robotwin'` requires exactly 3 cameras per group, got {num_cameras}"
+                )
+            def _rs(x, size):
+                return transforms_F.resize(
+                    x, size=size, interpolation=transforms_F.InterpolationMode.BILINEAR, antialias=True
+                )
+            bottom = torch.cat([_rs(cameras[1], [128, 160]), _rs(cameras[2], [128, 160])], dim=-1)
+            video = torch.cat([_rs(cameras[0], [256, 320]), bottom], dim=-2)  # [T, C, 384, 320]
+        elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
                 video = torch.cat([cameras[i] for i in range(num_cameras)], dim=-1)
             elif self.concat_multi_camera == "vertical":
@@ -181,7 +191,7 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             else:
                 raise ValueError(
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
-                    "Expected one of: horizontal, vertical."
+                    "Expected one of: horizontal, vertical, robotwin."
                 )
         else:
             video = cameras.squeeze(0)
