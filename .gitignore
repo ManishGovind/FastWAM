@@ -270,3 +270,18 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# Robot-local artifacts
+.codex/
+.agents/
+/observations/
+/rollouts/
+/relative_hdf5_replay_results/
+/demo_21_30_offline_results/
+/demo_21_30_robot_results/
+/debug_inference
+/experiments/r1lite/*.pre_*
+/experiments/r1lite/*.bak*
+/experiments/r1lite/migrate_rollout_trials.py
+/experiments/r1lite/replay_hdf5_relative_robot.py
+/experiments/r1lite/run_replay_hdf5_relative_robot.sh
