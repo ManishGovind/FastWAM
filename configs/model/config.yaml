@@ -1,15 +1,15 @@
-output_dir: ./runs/r1_lite_tasks_joint_3cam_384_1e-4/2026-08-30_22-43-17
-batch_size: 8
+output_dir: ./runs/r1lite_stack_bowl_rightarm_absarm_40ep/2026-09-24_11-26-03
+batch_size: 16
 num_workers: 8
 lr_scheduler_type: cosine
 learning_rate: 0.0001
-num_epochs: 20
-max_steps: null
+num_epochs: 10
+max_steps: 30000
 log_every: 10
 save_every: 5000
 eval_every: 5000
 eval_num_inference_steps: 10
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 1
 mixed_precision: bf16
 seed: 42
 max_grad_norm: 1.0
@@ -19,14 +19,14 @@ wandb:
   enabled: false
   workspace: null
   project: fast-wam
-  name: r1_lite_tasks_joint_3cam_384_1e-4
+  name: r1lite_stack_bowl_rightarm_absarm_40ep
   group: null
   mode: online
 data:
   train:
     _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
     dataset_dirs:
-    - /net/labs/sdas24_lab/Real-World-Data-R1-Lite/galaxea_stack_bowls_v5_processed_fastwam
+    - /home/data/FastWAM/data/local/galaxea_stack_bowl_rightarm_fastwam_absarm_40ep
     shape_meta:
       images:
       - key: image
@@ -73,6 +73,7 @@ data:
     camera_key: null
     val_set_proportion: 0.0
     is_training_set: true
+    pretrained_norm_stats: /home/data/FastWAM/data/galaxea_stack_bowl_rightarm_fastwam_absarm_40ep_dataset_stats_stdfloor.json
     skip_padding_as_possible: false
     concat_multi_camera: robotwin
     processor:
@@ -118,23 +119,8 @@ data:
       num_output_cameras: 3
       action_output_dim: 14
       proprio_output_dim: 14
-      delta_action_dim_mask:
-        default:
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - true
-        - false
-        - false
       action_state_transforms: null
+      delta_action_dim_mask: null
       use_stepwise_action_norm: false
       norm_default_mode: z-score
       norm_exception_mode: null
@@ -152,7 +138,7 @@ data:
         size:
         - 240
         - 320
-    text_embedding_cache_dir: ./data/text_embeds_cache/r1_lite_tasks
+    text_embedding_cache_dir: /home/data/FastWAM/data/text_embeds_cache/r1lite_stack_bowl_rightarm_absarm
     context_len: 128
 model:
   _target_: fastwam.runtime.create_fastwam_joint

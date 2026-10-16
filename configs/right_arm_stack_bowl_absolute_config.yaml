@@ -1,0 +1,29 @@
+# Standalone inference config for the 40-episode absolute-arm R1-Lite model.
+# This preserves the resolved training contract while replacing cluster-only
+# paths with workstation-local inference assets.
+defaults:
+  - data: r1lite_stack_bowl_rightarm_absarm_40ep
+  - model: fastwam_joint
+  - _self_
+
+output_dir: ./runs/right_arm_stack_bowl_absolute
+eval_num_inference_steps: 10
+mixed_precision: bf16
+seed: 42
+
+data:
+  train:
+    pretrained_norm_stats: ./runs/right_arm_stack_bowl_absolute/dataset_stats.json
+    text_embedding_cache_dir: ./data/text_embeds_cache
+
+model:
+  redirect_common_files: false
+  mot_checkpoint_mixed_attn: false
+  action_scheduler:
+    train_shift: 5.0
+    infer_shift: 5.0
+
+EVALUATION:
+  action_horizon: 32
+  num_inference_steps: 10
+  action_semantics: absolute

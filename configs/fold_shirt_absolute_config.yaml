@@ -1,0 +1,27 @@
+# Workstation inference config for the absolute-action fold-shirt checkpoint.
+defaults:
+  - data: r1lite_fold_shirt_absarm
+  - model: fastwam_joint
+  - _self_
+
+output_dir: ./runs/fold_shirt
+eval_num_inference_steps: 10
+mixed_precision: bf16
+seed: 42
+
+data:
+  train:
+    pretrained_norm_stats: ./runs/fold_shirt/dataset_stats.json
+    text_embedding_cache_dir: ./data/text_embeds_cache/r1lite_fold_shirt_absarm
+
+model:
+  redirect_common_files: false
+  mot_checkpoint_mixed_attn: false
+  action_scheduler:
+    train_shift: 5.0
+    infer_shift: 5.0
+
+EVALUATION:
+  action_horizon: 32
+  num_inference_steps: 10
+  action_semantics: absolute
