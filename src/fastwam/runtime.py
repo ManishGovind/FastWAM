@@ -360,6 +360,7 @@ def create_fastwam_joint_multimodal(
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     cross_stream_attention: str = "none",
+    stream_embedding: bool = False,
 ):
     """Factory for FastWAMJointMultimodal (RGB+depth+flow train, RGB-only infer)."""
     from .models.wan22.fastwam_joint_multimodal import FastWAMJointMultimodal
@@ -434,6 +435,7 @@ def create_fastwam_joint_multimodal(
         loss_lambda_flow=float(loss.get("lambda_flow", 1.0)),
         enabled_video_streams=enabled_video_streams,
         cross_stream_attention=str(cross_stream_attention),
+        stream_embedding=bool(stream_embedding),
         stream_router_mode=stream_router_mode,
         stream_router_temperature=float(stream_router_temperature),
     )

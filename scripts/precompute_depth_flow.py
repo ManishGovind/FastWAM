@@ -479,8 +479,19 @@ def process_episode(
     return stats
 
 
+# RoboTwin 2.0: head + two wrist cameras (select with --source-key; default stays LIBERO).
+ROBOTWIN_CAMERA_STREAMS = tuple(
+    {
+        "source_key": f"observation.images.{cam}",
+        "depth_key": f"observation.images.{cam}_depth",
+        "flow_key": f"observation.images.{cam}_flow",
+    }
+    for cam in ("cam_high", "cam_left_wrist", "cam_right_wrist")
+)
+
+
 def _resolve_camera_streams(source_keys: list[str] | None) -> list[dict[str, str]]:
-    catalog = {s["source_key"]: s for s in DEFAULT_CAMERA_STREAMS}
+    catalog = {s["source_key"]: s for s in DEFAULT_CAMERA_STREAMS + ROBOTWIN_CAMERA_STREAMS}
     if not source_keys:
         return [dict(s) for s in DEFAULT_CAMERA_STREAMS]
     streams = []
