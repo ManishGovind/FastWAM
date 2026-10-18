@@ -47,6 +47,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         tolerance_s: Optional[float] = None,
         video_backend: Optional[str] = None,
+        image_history_frames: int = 0,
+        image_history_keys: Optional[list] = None,
     ):
         self.lerobot_dataset = self.base_dataset_cls(
             dataset_dirs=dataset_dirs,
@@ -59,6 +61,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             image_subsample_stride=action_video_freq_ratio,
             tolerance_s=tolerance_s,
             video_backend=video_backend,
+            image_history_frames=image_history_frames,
+            image_history_keys=image_history_keys,
         )
     
         self.num_frames = num_frames

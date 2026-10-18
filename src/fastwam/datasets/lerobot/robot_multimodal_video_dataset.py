@@ -45,8 +45,23 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         modality_label_nearest: bool = True,
         # If true, only decode/pack RGB and emit ``video`` (no video_rgb/depth/flow).
         rgb_video_only: bool = False,
+        # RGB observation history for the router (R0 itself is a separate router input): H past
+        # frames t-H*s .. t-s of the rgb cameras at the video stride, plus one lead-in frame
+        # t-(H+1)*s because the causal VAE encodes a clip's first frame alone (its latent is
+        # dropped). Emitted as video_rgb_history [C, H+1, h, w] (same tile / resize / normalize as
+        # video_rgb) + history_is_pad [H+1]. H must be a multiple of 4 -> H/4 history latents.
+        image_history_frames: int = 0,
         **kwargs,
     ):
+        self.image_history_frames = int(image_history_frames)
+        if self.image_history_frames % 4 != 0:
+            raise ValueError(f"`image_history_frames` must be a multiple of 4, got {image_history_frames}")
+        if self.image_history_frames > 0:
+            groups_cfg = OmegaConf.to_container(modality_camera_groups, resolve=True) if isinstance(
+                modality_camera_groups, DictConfig) else dict(modality_camera_groups or {})
+            images = kwargs["shape_meta"]["images"]
+            kwargs["image_history_keys"] = [images[i]["key"] for i in groups_cfg["rgb"]]
+            kwargs["image_history_frames"] = self.image_history_frames + 1   # + lead-in frame
         super().__init__(*args, **kwargs)
         self.rgb_video_only = bool(rgb_video_only)
 
@@ -233,6 +248,11 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
             videos[modality] = self._pack_camera_group(cameras[cam_indices])
 
         video_rgb = videos["rgb"]
+        video_rgb_history = history_is_pad = None
+        if self.image_history_frames > 0:
+            # [lead-in | t-H*s .. t-s], already at the video stride; R0 (frame t) is not included
+            video_rgb_history = self._pack_camera_group(sample["history_pixel_values"])
+            history_is_pad = sample["history_is_pad"]
         if not self.rgb_video_only:
             # Unimodal parity: [RGB_t0, depth/flow_t≥1]
             for modality in self.rgb_condition_modalities:
@@ -272,6 +292,9 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         if not self.rgb_video_only:
             for name, video in videos.items():
                 data[f"video_{name}"] = video
+        if video_rgb_history is not None:
+            data["video_rgb_history"] = video_rgb_history
+            data["history_is_pad"] = history_is_pad
         if self.use_text_embed_cache:
             context, context_mask = self._get_cached_text_context(instruction)
             context[~context_mask] = 0.0

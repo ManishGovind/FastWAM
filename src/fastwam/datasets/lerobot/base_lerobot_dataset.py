@@ -40,6 +40,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         image_subsample_stride: int = 1,
         tolerance_s: Optional[float] = None,
         video_backend: Optional[str] = None,
+        # Image-only observation history (states / actions unchanged): the listed image keys also
+        # load `image_history_frames` past frames at stride image_subsample_stride, returned as
+        # sample["history_pixel_values"] [N_keys, H, C, h, w] + sample["history_is_pad"] [H].
+        image_history_frames: int = 0,
+        image_history_keys: Optional[List[str]] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -52,6 +57,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.past_action_size = past_action_size
         self.obs_size = obs_size
         self.image_subsample_stride = image_subsample_stride
+        self.image_history_frames = int(image_history_frames)
+        self.image_history_keys = list(image_history_keys or [])
+        if self.image_history_frames > 0 and not self.image_history_keys:
+            raise ValueError("`image_history_frames` > 0 requires `image_history_keys`.")
         self.processor = None  # Will be set externally
         metas = []
         for ds_dir in dataset_dirs:
@@ -82,7 +91,14 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 (t * global_sample_stride) / fps
                 for t in range(-past_obs_size, -past_obs_size + obs_size, image_stride)
             ]
-            delta_timestamps[meta["lerobot_key"]] = image_delta
+            if key in self.image_history_keys:
+                hist_delta = [
+                    (-k * self.image_subsample_stride * global_sample_stride) / fps
+                    for k in range(self.image_history_frames, 0, -1)
+                ]
+                delta_timestamps[meta["lerobot_key"]] = hist_delta + image_delta
+            else:
+                delta_timestamps[meta["lerobot_key"]] = image_delta
             future_key = meta.get("future_key")
             if future_key:
                 if future_key == key:
@@ -260,6 +276,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 f"for index {idx}."
             ) from last_exception
 
+        history = self._split_image_history(lerobot_sample)
+
         # Get data from lerobot, organized in nested dict
         sample = {
             "idx": sample_idx,
@@ -291,8 +309,38 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # for quick data loading
         if self.processor is not None:
             sample = self.processor.preprocess(sample)
+        if history is not None:
+            sample.update(self._process_image_history(*history))
 
         return sample
+
+    def _split_image_history(self, lerobot_sample):
+        """Cut the leading history frames off the history keys (in place); None if disabled."""
+        h = self.image_history_frames
+        if h <= 0:
+            return None
+        frames, is_pad = {}, None
+        for meta in self.image_meta:
+            if meta["key"] not in self.image_history_keys:
+                continue
+            lk = meta["lerobot_key"]
+            full, pad = lerobot_sample[lk], lerobot_sample[f"{lk}_is_pad"]
+            frames[meta["key"]] = (full[:h] * 255).to(torch.uint8)
+            lerobot_sample[lk], lerobot_sample[f"{lk}_is_pad"] = full[h:], pad[h:]
+            is_pad = pad[:h] if is_pad is None else is_pad
+        return frames, is_pad
+
+    def _process_image_history(self, frames, is_pad):
+        """Same per-key image transforms as the processor -> stacked in image_history_keys order."""
+        out = []
+        for key in self.image_history_keys:
+            image = frames[key]
+            if self.processor is not None:
+                transforms = self.processor.train_transforms if self.processor.is_train else self.processor.val_transforms
+                for trans in (transforms[key] if isinstance(transforms, dict) else transforms):
+                    image = trans(image)
+            out.append(image)
+        return {"history_pixel_values": torch.stack(out, dim=0), "history_is_pad": is_pad}
 
     def set_processor(self, processor: BaseProcessor):
         """Set processor instance from external initialization."""
