@@ -119,6 +119,9 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # Router input: "raw" = flattened R0 VAE latent + T5/proprio tokens (ModalityRouter);
         # "embed" = the video expert's own patch/text embeddings, shared + detached (EmbedModalityRouter).
         router_input = str(kwargs.pop("router_input", "raw")).lower()
+        # Router also reads the RGB observation history (embed router only; data: image_history_frames).
+        router_history = bool(kwargs.pop("router_history", False))
+        router_history_frames = int(kwargs.pop("router_history_frames", 8) or 8)
         if router_input not in ("raw", "embed"):
             raise ValueError(f"`router_input` must be 'raw' or 'embed', got {router_input!r}")
         if modality_prompt_target not in MODALITY_PROMPT_TARGETS:
@@ -171,6 +174,12 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.router_layout = router_layout
         model.router_video_loss = router_video_loss
         model.router_input = router_input
+        model.router_history = router_history
+        model.router_history_frames = router_history_frames   # = data.train.image_history_frames
+        if router_history and router_input != "embed":
+            raise ValueError("`router_history` requires `router_input: embed`.")
+        # VAE latents of the history clip for the current call (set in training_loss / infer_*).
+        model._router_history_latent = None
         # Per-sample [B, K] additive gate on (action rows, future cols); see
         # _build_multistream_mot_attention_mask / _action_stream_gate.
         model._action_stream_log_gate = None
@@ -265,6 +274,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 raise ValueError("router_input=embed expects the proprio token as the last context token.")
             router = EmbedModalityRouter(
                 dim=int(model.video_expert.hidden_dim), num_classes=len(enabled), hidden=hidden, dropout=dropout,
+                history=bool(getattr(model, "router_history", False)),
             ).to(device=model.device, dtype=torch.float32)
             logger.info("Built EmbedModalityRouter classes=%s dim=%d (expert patch/text embeddings, "
                         "attention-pooled R0 + mean text + proprio)", list(enabled), router.dim)
@@ -475,7 +485,16 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 r0 = ve.patch_embedding(r0_latent.unsqueeze(2).to(dtype)).flatten(2).transpose(1, 2)
                 ctx = ve.text_embedding(context.to(dtype))
             mask = context_mask.bool()
-            return {"r0": r0, "text": ctx[:, :-1], "text_mask": mask[:, :-1], "proprio": ctx[:, -1]}
+            feats = {"r0": r0, "text": ctx[:, :-1], "text_mask": mask[:, :-1], "proprio": ctx[:, -1]}
+            if getattr(self, "router_history", False):
+                hist = self._router_history_latent
+                if hist is None:
+                    # No history given (e.g. trainer eval): a static scene, like an episode start.
+                    n_lat = max(1, int(getattr(self, "router_history_frames", 8)) // 4)
+                    hist = r0_latent.unsqueeze(2).expand(-1, -1, n_lat, -1, -1)
+                with torch.no_grad():
+                    feats["hist"] = ve.patch_embedding(hist.to(dtype)).flatten(2).transpose(1, 2)
+            return feats
         r0 = r0_latent.detach().float().flatten(1)
         ctx = context.detach().float()
         mask = context_mask.bool()
@@ -859,6 +878,18 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         is_action_row[base.shape[-1] - int(action_seq_len):] = 1.0
         base_f = torch.zeros(base.shape, device=device).masked_fill(~base, float("-inf"))
         return (base_f[None] + is_action_row[None, :, None] * col_bias[:, None, :]).to(self.torch_dtype)
+
+    @torch.no_grad()
+    def _encode_router_history(self, video: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """[B, 3, H+1, h, w] history clip [lead-in, t-H*s .. t-s] in [-1, 1] (no R0) -> its VAE latents
+        without the first one (the lead-in frame, encoded alone): H/4 latent frames,
+        e.g. H=4 -> 1 latent covering t-16 .. t-4, H=8 -> 2 (t-32 .. t-4)."""
+        if video is None or not getattr(self, "router_history", False):
+            return None
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        lat = self._encode_video_latents(video.to(device=self.device, dtype=self.torch_dtype), tiled=False)
+        return lat[:, :, 1:]
 
     def _encode_stream_latents(
         self,
@@ -1275,6 +1306,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             action, noise_action, timestep_action
         )
 
+        self._router_history_latent = self._encode_router_history(sample.get("video_rgb_history"))
         selected_modality = sample.get("selected_modality", None)
         if selected_modality is not None and not torch.is_tensor(selected_modality):
             selected_modality = torch.as_tensor(selected_modality)
@@ -1828,9 +1860,12 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
         prompt_text: Optional[str] = None,
+        history_images: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         del compile_action_infer, negative_prompt, text_cfg_scale
         self.eval()
+        # [3, H+1, h, w] RGB history clip in [-1, 1] (router_history models only)
+        self._router_history_latent = self._encode_router_history(history_images)
         action_attend_mode = self._validate_action_attend_mode(action_attend_mode)
         if action_attend_mode != "all":
             logger.info(
@@ -1921,9 +1956,12 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         action_attend_mode: str = "all",
         active_future: Optional[str] = None,
         prompt_text: Optional[str] = None,
+        history_images: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         del compile_action_infer, negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
+        # [3, H+1, h, w] RGB history clip in [-1, 1] (router_history models only)
+        self._router_history_latent = self._encode_router_history(history_images)
         action_attend_mode = self._validate_action_attend_mode(action_attend_mode)
         if action_attend_mode != "all":
             logger.info(

@@ -49,6 +49,8 @@ def create_fastwam_joint_multimodal_select_new(
     modality_prompt_target: str = "both",
     stream_embedding: bool = False,
     router_input: str = "raw",
+    router_history: bool = False,
+    router_history_frames: int = 8,
     mot_checkpoint_mixed_attn: bool = False,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -159,6 +161,8 @@ def create_fastwam_joint_multimodal_select_new(
         modality_prompt_target=str(modality_prompt_target),
         stream_embedding=bool(stream_embedding),
         router_input=str(router_input),
+        router_history=bool(router_history),
+        router_history_frames=int(router_history_frames),
         **(_extra_kwargs or {}),
     )
 
