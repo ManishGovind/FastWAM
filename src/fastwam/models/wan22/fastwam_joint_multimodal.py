@@ -47,6 +47,11 @@ class FastWAMJointMultimodal(FastWAMJoint):
         loss_lambda_depth = float(kwargs.pop("loss_lambda_depth", 1.0))
         loss_lambda_flow = float(kwargs.pop("loss_lambda_flow", 1.0))
         enabled_video_streams = kwargs.pop("enabled_video_streams", None)
+        cross_stream_attention = str(kwargs.pop("cross_stream_attention", "none")).lower()
+        if cross_stream_attention not in ("none", "cascade", "full"):
+            raise ValueError(
+                f"`cross_stream_attention` must be none|cascade|full, got {cross_stream_attention!r}"
+            )
         stream_router_mode = str(kwargs.pop("stream_router_mode", "off")).lower()
         stream_router_temperature = float(kwargs.pop("stream_router_temperature", 1.0))
         model = super().from_wan22_pretrained(**kwargs)
@@ -54,14 +59,17 @@ class FastWAMJointMultimodal(FastWAMJoint):
         model.loss_lambda_depth = loss_lambda_depth
         model.loss_lambda_flow = loss_lambda_flow
         model.enabled_video_streams = cls._normalize_enabled_streams(enabled_video_streams)
+        model.cross_stream_attention = cross_stream_attention
 
         # Stream router is currently unused; keep kwargs accepted so Hydra configs
         # with stream_router_* still instantiate cleanly.
         del stream_router_mode, stream_router_temperature
 
         logger.info(
-            "FastWAMJointMultimodal streams=%s loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
+            "FastWAMJointMultimodal streams=%s cross_stream_attention=%s "
+            "loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
             list(model.enabled_video_streams),
+            model.cross_stream_attention,
             model.loss_lambda_rgb,
             model.loss_lambda_depth,
             model.loss_lambda_flow,
@@ -177,6 +185,15 @@ class FastWAMJointMultimodal(FastWAMJoint):
         if flow_fut_sl is not None:
             mask[flow_fut_sl, rgb_cond_sl] = True
             mask[flow_fut_sl, flow_fut_sl] = True
+        # Cross-modal future interactions (default "none" = original MM).
+        #   cascade: D_f -> R_f ; F_f -> R_f + D_f   (RGB -> depth -> flow)
+        #   full:    every future attends every other future
+        cross = getattr(self, "cross_stream_attention", "none")
+        futs = [sl for sl in (rgb_fut_sl, depth_fut_sl, flow_fut_sl) if sl is not None]
+        for i, q in enumerate(futs):
+            for j, k in enumerate(futs):
+                if (cross == "cascade" and j < i) or (cross == "full" and j != i):
+                    mask[q, k] = True
 
         mask[action_sl, action_sl] = True
 
