@@ -1,0 +1,369 @@
+<meta charset="utf-8">
+<title>SR-MoT Attention Mask</title>
+  <meta name="claude:viewport-fit-sides" content="cover">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+  <style>
+  /* Layout: one reading column; a wrapping row of block-mask "plates" (MM + three selections), then short-layout plates, rules table, code. */
+  :root {
+    --bg: #f6f7f8;
+    --surface: #ffffff;
+    --fg: #1b2026;
+    --muted: #5b6570;
+    --line: #d9dee3;
+    --cell-off: #e7eaee;      /* blocked */
+    --cell-on: #c9d1d9;       /* allowed / self */
+    --cond: #f2f4f6;          /* R0 condition (outlined) */
+    --cond-line: #6b7682;
+    --accent: #0f6e78;        /* action -> video */
+    --gate: #c2423a;          /* gated off, -1e4 */
+    --gate-fill: #f6dcd9;
+    --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161a; --surface: #1a1f25; --fg: #e4e8ec; --muted: #9aa5b0; --line: #2e353d;
+      --cell-off: #232a31; --cell-on: #3b4651; --cond: #1f252c; --cond-line: #a3aeb9;
+      --accent: #3fb5c1; --gate: #ef7b72; --gate-fill: #3a2422; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161a; --surface: #1a1f25; --fg: #e4e8ec; --muted: #9aa5b0; --line: #2e353d;
+    --cell-off: #232a31; --cell-on: #3b4651; --cond: #1f252c; --cond-line: #a3aeb9;
+    --accent: #3fb5c1; --gate: #ef7b72; --gate-fill: #3a2422; color-scheme: dark;
+  }
+  body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.55; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding-block: 32px 56px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: flex; flex-direction: column; gap: 36px; }
+  h1, h2 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: 0.005em; }
+  h1 { font-size: clamp(1.6rem, 3.2vw, 2.2rem); line-height: 1.15; }
+  h2 { font-size: 1.3rem; }
+  p { margin: 0; max-width: 68ch; }
+  .muted { color: var(--muted); }
+  code, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+  .eyebrow { font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  header { display: flex; flex-direction: column; gap: 12px; }
+  .seq { font-family: var(--font-mono); font-size: 0.95rem; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; align-self: flex-start; max-width: 100%; overflow-x: auto; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+  .fact { border-top: 2px solid var(--fg); padding-top: 8px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .fact b { font-family: var(--font-display); font-size: 1.35rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .fact span { color: var(--muted); font-size: 0.86rem; }
+  section { display: flex; flex-direction: column; gap: 14px; }
+  .plates { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+  .rowlabel { font-family: var(--font-mono); font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .plates.wide { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+  .plate { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .plate.ref { border-style: dashed; }
+  .plate h3 { margin: 0; font-family: var(--font-display); font-weight: 600; font-size: 1.02rem; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .tag { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 500; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .tag.sel { border-color: var(--accent); color: var(--accent); }
+  .plate p { font-size: 0.86rem; color: var(--muted); }
+  .svgbox { overflow-x: auto; }
+  svg text { font-family: var(--font-mono); fill: var(--fg); }
+  svg .axis { fill: var(--muted); font-size: 9px; }
+  svg .lbl { font-size: 11px; font-weight: 500; }
+  /* Two states only: allowed (1-4) and blocked (0, and 5 = hidden by the per-sample gate). */
+  .c1, .c2, .c3, .c4 { fill: var(--accent); }
+  .c0, .c5 { fill: var(--cell-off); }
+  svg .nolossrow { opacity: 0.28; }  /* future in the sequence but without a video loss */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.84rem; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  .table-box { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; min-width: 560px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-family: var(--font-mono); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 500; }
+  tr:last-child td { border-bottom: 0; }
+  td.yes { color: var(--accent); font-weight: 500; }
+  td.no { color: var(--gate); font-weight: 500; }
+  .code-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  pre { margin: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.55; min-width: 0; }
+  .note { border-left: 3px solid var(--gate); padding: 4px 0 4px 14px; display: flex; flex-direction: column; gap: 6px; }
+  .note h2 { font-size: 1.08rem; }
+  .notation { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 6px 24px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin: 0; }
+  .notation div { display: grid; grid-template-columns: 4.2em 1fr; gap: 10px; align-items: baseline; min-width: 0; }
+  .notation dt { font-family: var(--font-mono); font-weight: 500; margin: 0; }
+  .notation dd { margin: 0; color: var(--muted); font-size: 0.88rem; }
+  sub { font-size: 0.72em; }
+  .src { font-size: 0.8rem; color: var(--muted); }
+  </style>
+  
+  <div class="wrap">
+    <header>
+      <div class="eyebrow">FastWAM · MoT attention · SR-MoT (random / router)</div>
+      <h1>Selective MoT: dense multi-future supervision, gated single-future readout</h1>
+      <p class="muted">Same token sequence and video mask as Multimodal Joint (MM). Only the action rows change: per sample, a one-hot gate hides every future except the selected one, X. In SR-MoT (random), code name <code>random_full_all</code>, X is drawn uniformly per sample. In SR-MoT (router), code name <code>router_full_all</code>, the router samples X in training and takes the argmax at eval.</p>
+      <div class="seq">[ R<sub>0</sub> | R<sub>f</sub> | D<sub>f</sub> | F<sub>f</sub> | A ]  =  98 + 196 + 196 + 196 + 32  =  718 tokens (LIBERO)</div>
+    </header>
+
+    <dl class="notation">
+      <div><dt>R<sub>0</sub></dt><dd>current RGB observation, the clean condition frame (1 latent frame, 98 tokens)</dd></div>
+      <div><dt>R<sub>f</sub></dt><dd>future RGB, 2 latent frames (196 tokens)</dd></div>
+      <div><dt>D<sub>f</sub></dt><dd>future depth, 2 latent frames (196 tokens)</dd></div>
+      <div><dt>F<sub>f</sub></dt><dd>future optical flow, 2 latent frames (196 tokens)</dd></div>
+      <div><dt>A</dt><dd>action chunk, 32 steps (32 tokens)</dd></div>
+      <div><dt>X</dt><dd>selected modality, X ∈ {R, D, F}; X<sub>f</sub> is its future</dd></div>
+    </dl>
+
+    <div class="facts">
+      <div class="fact"><b>R<sub>f</sub> + D<sub>f</sub> + F<sub>f</sub></b><span>Video loss on all three futures, every sample</span></div>
+      <div class="fact"><b>R<sub>0</sub> + X<sub>f</sub></b><span>Action reads the condition frame and the selected future only</span></div>
+      <div class="fact"><b>One-hot gate</b><span>Per sample, blocks the unselected futures on the action rows</span></div>
+      <div class="fact"><b>= blocked</b><span>Gate value −1e4 in code; bit-identical to a False (blocked) entry under SDPA, fp32 and bf16</span></div>
+    </div>
+  
+    <section>
+      <h2>Block masks</h2>
+      <div class="legend">
+        <span><i class="sw" style="background:var(--accent)"></i>allowed</span>
+        <span><i class="sw" style="background:var(--cell-off)"></i>blocked (on SR-MoT action rows: the unselected futures, per sample)</span>
+        <span><i class="sw" style="background:var(--accent);opacity:0.28"></i>faded row: future in the sequence with no video loss</span>
+      </div>
+      <div class="rowlabel">Unimodal Joint: one future stream, trained alone</div>
+      <div class="plates" id="uni"></div>
+      <div class="rowlabel">Multimodal: MM and SR-MoT, all three futures in the sequence</div>
+      <div class="plates" id="full"></div>
+      <div class="rowlabel">Proposed baseline: MM + cross-modal future interactions (cross_stream_attention)</div>
+      <div class="plates" id="cross"></div>
+      <div class="rowlabel">Full + chosen: same mask as SR-MoT, video loss on the chosen future only (≡ short layout)</div>
+      <div class="plates" id="chosen"></div>
+      <p class="src">Rows = queries, columns = keys. Blocks collapse patch tokens; the real mask is [B, 718, 718] with the gate applied per sample.</p>
+    </section>
+  
+    <section>
+      <h2>Flex-π attention, for comparison</h2>
+      <p class="muted">Built with Flex-π's own mask functions from <code>/data/mgovind/flex-pi</code> (<code>_base_build_mot_attention_mask_unified</code>, <code>_apply_joint_flag_deltas</code>, <code>_apply_presence_absent_edits</code>; HBridge in <code>mot.py</code>), robotwin config <code>configs/model/flexpi.yaml</code>. Every block is all-allowed or all-blocked.</p>
+      <dl class="notation">
+        <div><dt>V<sub>0</sub>, V<sub>f</sub></dt><dd>RGB video: current frame (anchor) and future frames</dd></div>
+        <div><dt>S<sub>0</sub>, S<sub>f</sub></dt><dd>DINOv3 semantic features: anchor and future</dd></div>
+        <div><dt>P<sub>0</sub>, P<sub>f</sub></dt><dd>3D pointmap (Depth Anything 3): anchor and future</dd></div>
+        <div><dt>A</dt><dd>action chunk</dd></div>
+      </dl>
+      <div class="rowlabel">Middle 16 of 30 layers (joint attention) · shown as [anchors | futures | A]; stored per stream as [V₀ V_f | S₀ S_f | P₀ P_f | A] (same attention)</div>
+      <div class="plates wide" id="flexpi"></div>
+      <div class="rowlabel">Outer layers: bottom 7 + top 7 of 30 (HBridge, hbridge.bottom_ratio = top_ratio = 0.25)</div>
+      <div class="plates wide" id="flexpi_outer"></div>
+      <div class="table-box">
+        <table>
+          <thead><tr><th>Design choice</th><th>MM</th><th>SR-MoT</th><th>MM + cascade</th><th>Flex-π</th></tr></thead>
+          <tbody>
+            <tr><td>Current-observation anchor</td><td>one shared R<sub>0</sub></td><td>one shared R<sub>0</sub></td><td>one shared R<sub>0</sub></td><td>one per stream: V<sub>0</sub>, S<sub>0</sub>, P<sub>0</sub> (DINO and pointmap of the current frame), attending each other</td></tr>
+            <tr><td>Future ↔ future across streams</td><td class="no">no</td><td class="no">no</td><td>ordered: D<sub>f</sub>→R<sub>f</sub>, F<sub>f</sub>→R<sub>f</sub>+D<sub>f</sub></td><td class="yes">all, both ways (middle layers)</td></tr>
+            <tr><td>Future → other streams' anchors</td><td>(only R<sub>0</sub>)</td><td>(only R<sub>0</sub>)</td><td>(only R<sub>0</sub>)</td><td class="yes">yes</td></tr>
+            <tr><td>Where cross-stream attention happens</td><td>—</td><td>—</td><td>all 30 layers</td><td>middle 16 layers only; outer 14 are per-stream</td></tr>
+            <tr><td>Action reads</td><td>R<sub>0</sub> + all futures</td><td>R<sub>0</sub> + one selected future</td><td>R<sub>0</sub> + all futures</td><td>anchors always; each stream's future only if its joint flag is on (deploy: all on)</td></tr>
+            <tr><td>Action in outer layers</td><td>reads video</td><td>reads video</td><td>reads video</td><td>self only</td></tr>
+            <tr><td>Training-time randomization</td><td>none</td><td>stream choice per sample</td><td>none</td><td>per sample: stream presence (p = 0.5) and joint flags (p = 0.5); absent streams are still predicted from the others (cross_modal_predict)</td></tr>
+            <tr><td>Stream identity</td><td>none</td><td>adaLN stream embedding</td><td>none (optional streamemb)</td><td>separate input projections and output heads per stream</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">The XOR rule in Flex-π: when exactly one of two streams has its joint flag on, their futures stop attending each other, so a future the action reads is never mixed with one it does not read. Compared with your designs, Flex-π is closest to <code>cross_stream_attention: full</code>, restricted to the middle layers, plus per-stream anchors and randomized readout.</p>
+    </section>
+
+    <section>
+      <h2>ModAR attention, for comparison</h2>
+      <p class="muted">Built with ModAR's own <code>_build_causal_mask</code> (<code>util/modality_forcing/model.py</code>, repo <code>adamhung60/ModAR-code</code>, config <code>conf/methods/modar.yaml</code>). ModAR generates the modalities <b>one after another</b>: generation order tracks → DINO → depth → image → action; each modality is fully denoised before the next starts (<code>_sample_causal</code>), and later ones condition on the finished earlier ones.</p>
+      <dl class="notation">
+        <div><dt>X<sub>0</sub></dt><dd>clean current observation (history) of DINO S, depth D, image I; bidirectional among themselves</dd></div>
+        <div><dt>X<sub>c</sub></dt><dd>clean copy of modality X's future (teacher forcing in training; the already generated future at inference)</dd></div>
+        <div><dt>X<sub>q</sub></dt><dd>noisy query of X's future, the block being denoised</dd></div>
+        <div><dt>T, S, D, I, A</dt><dd>point tracks, DINO, depth, RGB image, action</dd></div>
+      </dl>
+      <div class="rowlabel">Training: all queries in one pass ("double-sequence" teacher forcing)</div>
+      <div class="plates" id="modar" style="grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));"></div>
+      <div class="rowlabel">Inference: one stage per modality (shown: generating D, after T and S are done)</div>
+      <div class="plates wide" id="modar_infer"></div>
+      <div class="table-box">
+        <table>
+          <thead><tr><th></th><th>MM</th><th>MM + cascade</th><th>Flex-π</th><th>ModAR</th></tr></thead>
+          <tbody>
+            <tr><td>Futures generated</td><td>jointly, same noise level</td><td>jointly, same noise level</td><td>jointly, same noise level</td><td><b>sequentially</b>, one modality fully denoised at a time</td></tr>
+            <tr><td>Cross-modal future dependency</td><td>none</td><td>ordered R → D → F, on <b>noisy</b> co-denoised futures</td><td>all-to-all, on noisy co-denoised futures</td><td>ordered T → S → D → I → A, on <b>clean / finished</b> earlier futures</td></tr>
+            <tr><td>Current observation</td><td>R<sub>0</sub> only</td><td>R<sub>0</sub> only</td><td>V<sub>0</sub>, S<sub>0</sub>, P<sub>0</sub></td><td>S<sub>0</sub>, D<sub>0</sub>, I<sub>0</sub> (no tracks history)</td></tr>
+            <tr><td>Action</td><td>joint with the futures; reads R<sub>0</sub> + all futures</td><td>same</td><td>joint; reads anchors (+ futures by joint flag)</td><td><b>last</b> in the order; reads history + all finished futures</td></tr>
+            <tr><td>Training</td><td>one noisy copy per future</td><td>same</td><td>same, with stream presence/joint randomization</td><td>clean teacher copies + noisy queries for every modality in one pass (12 blocks)</td></tr>
+            <tr><td>Inference cost</td><td>one joint loop</td><td>one joint loop</td><td>one joint loop (or action-only)</td><td>one loop per modality (5 stages), KV-cached prefix</td></tr>
+            <tr><td>Backbone</td><td colspan="3">Wan2.2-5B video DiT + action expert (MoT)</td><td>small adaLN DiT from scratch: 6 shared + 1–2 expert layers per modality, dim 384</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted">Your cascade has the same <i>direction</i> of dependency as ModAR (later modality conditioned on earlier ones), but ModAR conditions on a finished, clean earlier modality, while the cascade conditions on a noisy one being denoised at the same time. ModAR's training pass is a lower-triangular "clean prefix" pattern (C rows) plus queries that see only strictly earlier clean blocks and themselves (Q rows).</p>
+    </section>
+
+    <section>
+      <h2>Equivalent short layout at inference</h2>
+      <p class="muted">Futures never attend to each other, so dropping the hidden ones changes nothing for R<sub>0</sub>, X<sub>f</sub> or A. SR-MoT with selected X equals the short layout [R<sub>0</sub> | X<sub>f</sub> | A]: max |a<sub>full</sub> − a<sub>short</sub>| = 8e-6 in fp32, and 1,974 of 2,000 LIBERO episodes came out identical. Short is cheaper: 326 tokens against 718.</p>
+      <div class="plates" id="short"></div>
+    </section>
+  
+    <section>
+      <h2>Rules</h2>
+      <div class="table-box">
+        <table>
+          <thead><tr><th>Query → keys</th><th>MM</th><th>SR-MoT, selected = X</th><th>Full + chosen (≡ short)</th></tr></thead>
+          <tbody>
+            <tr><td>R<sub>0</sub> → R<sub>0</sub></td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>R<sub>f</sub> → R<sub>0</sub> + R<sub>f</sub></td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>D<sub>f</sub> → R<sub>0</sub> + D<sub>f</sub></td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>F<sub>f</sub> → R<sub>0</sub> + F<sub>f</sub></td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>between futures (R<sub>f</sub> ↔ D<sub>f</sub> ↔ F<sub>f</sub>)</td><td class="no">no</td><td class="no">no</td><td class="no">no</td></tr>
+            <tr><td>video → A</td><td class="no">no</td><td class="no">no</td><td class="no">no</td></tr>
+            <tr><td>A → R<sub>0</sub>, A</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>A → X<sub>f</sub> (selected)</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+            <tr><td>A → other futures</td><td class="yes">yes</td><td class="no">no (blocked per sample)</td><td class="no">no (blocked per sample)</td></tr>
+            <tr><td>Video loss</td><td>R<sub>f</sub> + D<sub>f</sub> + F<sub>f</sub></td><td>R<sub>f</sub> + D<sub>f</sub> + F<sub>f</sub></td><td>X<sub>f</sub> only</td></tr>
+            <tr><td>Selection of X in training</td><td>none</td><td>random: uniform per sample · router: sampled (uniform during warm-up)</td><td>same as SR-MoT</td></tr>
+            <tr><td>Inference</td><td>all futures denoised</td><td>full: only X<sub>f</sub> is stepped, the others stay noise · short: X<sub>f</sub> only</td><td>same as SR-MoT</td></tr>
+            <tr><td>Equivalent to</td><td>—</td><td>short layout for the action; MM video supervision</td><td>short layout, in training and inference</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  
+    <section>
+      <h2>Mask code</h2>
+      <div class="code-grid">
+  <pre># bool base, identical to MM
+  allow = {"R0": {"R0"},
+           "A":  {"R0", "A", "rgb", "depth", "flow"}}
+  allow.update({n: {"R0", n} for n in streams})
+  block = [[col in allow[row] for col in names]
+           for row in names]      # repeat_interleave -> [S, S]</pre>
+  <pre># per-sample gate on the action rows
+  gate = one_hot(choice) -> 0 chosen / -1e4 others   # [B, 3]; -1e4 == blocked
+  block_bias = cat([0, gate, 0])     # [B, R0 | rgb depth flow | A]
+  col_bias   = repeat_interleave(block_bias, sizes)       # [B, S]
+  mask = where(base, 0, -inf)[None]
+       + is_action_row[None, :, None] * col_bias[:, None, :]  # [B, S, S]</pre>
+      </div>
+      <p class="src">Source: <code>fastwam_joint_multimodal_select_new.py</code>: <code>_build_multistream_mot_attention_mask_base</code>, <code>_build_multistream_mot_attention_mask</code>, <code>_one_hot_gate</code>.</p>
+    </section>
+  
+    <div class="note">
+      <h2>Slot identity</h2>
+      <p>The mask names the slots R<sub>f</sub>, D<sub>f</sub> and F<sub>f</sub>, but nothing in the tokens says which modality a slot holds: all three share RoPE positions and adaLN. Up to σ = 0.95 each slot reconstructs its own modality; at σ = 1, where inference starts, the starting noise decides. With seed 42 the R<sub>f</sub> slot decodes depth, so X = R reads whatever the R<sub>f</sub> slot produced. The stream embedding in <code>router_full_all_streamemb_embed</code> is the fix under test.</p>
+    </div>
+  </div>
+  
+  <script>
+  (function () {
+    // Labels use "_" for a subscript: "R_f" -> R with subscript f.
+    var B = ["R_0", "R_f", "D_f", "F_f", "A"];
+    var S = ["rgb", "depth", "flow"];
+    var SYM = { rgb: "R_f", depth: "D_f", flow: "F_f" };
+    var X = { rgb: "R", depth: "D", flow: "F" };
+    var NAME = { rgb: "RGB", depth: "depth", flow: "flow" };
+    function svgLab(l) {
+      var p = l.split("_");
+      return p.length < 2 ? p[0] : p[0] + '<tspan font-size="8" dy="3">' + p[1] + '</tspan>';
+    }
+    function htmlLab(l) {
+      var p = l.split("_");
+      return p.length < 2 ? p[0] : p[0] + "<sub>" + p[1] + "</sub>";
+    }
+    // 0 blocked, 1 allowed, 2 action->video, 3 R0 cond, 4 self, 5 hidden by the per-sample gate
+    var VIDEO = [[4,0,0,0,0],[3,4,0,0,0],[3,0,4,0,0],[3,0,0,4,0]];
+    function matrix(rows, cols, cells, faded) {
+      faded = faded || [];
+      var cs = 34, lw = 46, lh = 30, w = lw + cols.length * cs + 4, h = lh + rows.length * cs + 4;
+      var s = '<svg viewBox="0 0 ' + w + ' ' + h + '" width="' + w + '" height="' + h + '" role="img" aria-label="attention mask">';
+      s += '<text class="axis" x="' + (lw + cols.length * cs / 2) + '" y="10" text-anchor="middle">keys →</text>';
+      s += '<text class="axis" x="4" y="' + (lh - 6) + '">query ↓</text>';
+      cols.forEach(function (c, j) { s += '<text class="lbl" x="' + (lw + j * cs + cs / 2) + '" y="' + (lh - 8) + '" text-anchor="middle">' + svgLab(c) + '</text>'; });
+      rows.forEach(function (r, i) {
+        var fade = faded.indexOf(i) >= 0;
+        s += '<g' + (fade ? ' class="nolossrow"' : '') + '>';
+        s += '<text class="lbl" x="' + (lw - 6) + '" y="' + (lh + i * cs + cs / 2 + 2) + '" text-anchor="end">' + svgLab(r) + '</text>';
+        cells[i].forEach(function (v, j) {
+          var x = lw + j * cs + 2, y = lh + i * cs + 2;
+          s += '<rect class="c' + v + '" x="' + x + '" y="' + y + '" width="' + (cs - 4) + '" height="' + (cs - 4) + '" rx="3"></rect>';
+        });
+        s += '</g>';
+      });
+      return s + '</svg>';
+    }
+    function plate(title, tag, sel, svg, cap, ref) {
+      return '<div class="plate' + (ref ? ' ref' : '') + '"><h3>' + title + '<span class="tag' + (sel ? ' sel' : '') + '">' + tag + '</span></h3>' +
+        '<div class="svgbox">' + svg + '</div><p>' + cap + '</p></div>';
+    }
+    function seq(st) { return "[R<sub>0</sub> | " + htmlLab(SYM[st]) + " | A]"; }
+    var uni = "";
+    S.forEach(function (st) {
+      var L = ["R_0", SYM[st], "A"];
+      uni += plate("Unimodal Joint", NAME[st] + " model", false, matrix(L, L, [[4,0,0],[3,4,0],[2,2,1]]),
+        seq(st) + ". A reads R<sub>0</sub> + " + htmlLab(SYM[st]) + "; video loss on " + htmlLab(SYM[st]) + ".");
+    });
+    document.getElementById("uni").innerHTML = uni;
+    var html = plate("Multimodal Joint (MM)", "reference", false,
+      matrix(B, B, VIDEO.concat([[2,2,2,2,1]])),
+      "A reads R<sub>0</sub> + R<sub>f</sub> + D<sub>f</sub> + F<sub>f</sub>.", true);
+    S.forEach(function (st) {
+      var a = [2].concat(S.map(function (x) { return x === st ? 2 : 5; })).concat([1]);
+      html += plate("SR-MoT", "X = " + X[st], true, matrix(B, B, VIDEO.concat([a])),
+        "A reads R<sub>0</sub> + " + htmlLab(SYM[st]) + "; the other futures are blocked for A. Video rows as in MM.");
+    });
+    document.getElementById("full").innerHTML = html;
+    var MM_A = [2,2,2,2,1];
+    var cross = plate("MM", "none (current)", false, matrix(B, B, VIDEO.concat([MM_A])),
+      "Futures attend only R<sub>0</sub> and themselves.", true);
+    cross += plate("MM + cascade", "R → D → F", true,
+      matrix(B, B, [[4,0,0,0,0],[3,4,0,0,0],[3,1,4,0,0],[3,1,1,4,0], MM_A]),
+      "D<sub>f</sub> also attends R<sub>f</sub>; F<sub>f</sub> also attends R<sub>f</sub> + D<sub>f</sub>. R<sub>f</sub> unchanged.");
+    cross += plate("MM + full", "all futures", true,
+      matrix(B, B, [[4,0,0,0,0],[3,4,1,1,0],[3,1,4,1,0],[3,1,1,4,0], MM_A]),
+      "Every future attends every other future. Action rows and R<sub>0</sub> unchanged.");
+    document.getElementById("cross").innerHTML = cross;
+    var ch = "";
+    S.forEach(function (st, k) {
+      var a = [2].concat(S.map(function (x) { return x === st ? 2 : 5; })).concat([1]);
+      var faded = [1, 2, 3].filter(function (r) { return r !== k + 1; });  // rows of the unselected futures
+      ch += plate("Full + chosen", "X = " + X[st], true, matrix(B, B, VIDEO.concat([a]), faded),
+        "Mask as SR-MoT. Only " + htmlLab(SYM[st]) + " gets a video loss; the faded futures affect nothing, so this equals " + seq(st) + ".");
+    });
+    document.getElementById("chosen").innerHTML = ch;
+    var sh = "";
+    S.forEach(function (st) {
+      var L = ["R_0", SYM[st], "A"];
+      sh += plate("Short layout", "X = " + X[st], true, matrix(L, L, [[4,0,0],[3,4,0],[2,2,1]]),
+        seq(st) + ": 98 + 196 + 32 = 326 tokens.");
+    });
+    document.getElementById("short").innerHTML = sh;
+
+    // Flex-pi block masks, generated by its own functions (1 = allowed, 0 = blocked)
+    var FB = ["V_0", "S_0", "P_0", "V_f", "S_f", "P_f", "A"];   // displayed [anchors | futures | A]; Flex-pi stores [V0 Vf | S0 Sf | P0 Pf | A]
+    var FX = {
+      full_joint: [[1,1,1,0,0,0,0],[1,1,1,0,0,0,0],[1,1,1,0,0,0,0],[1,1,1,1,1,1,0],[1,1,1,1,1,1,0],[1,1,1,1,1,1,0],[1,1,1,1,1,1,1]],
+      action_only: [[1,1,1,0,0,0,0],[1,1,1,0,0,0,0],[1,1,1,0,0,0,0],[1,1,1,1,1,1,0],[1,1,1,1,1,1,0],[1,1,1,1,1,1,0],[1,1,1,0,0,0,1]],
+      joint_video: [[1,1,1,0,0,0,0],[1,1,1,0,0,0,0],[1,1,1,0,0,0,0],[1,1,1,1,0,0,0],[1,1,1,0,1,1,0],[1,1,1,0,1,1,0],[1,1,1,1,0,0,1]],
+      video_absent: [[0,0,0,0,0,0,0],[0,1,1,0,0,0,0],[0,1,1,0,0,0,0],[0,1,1,1,1,1,0],[0,1,1,1,1,1,0],[0,1,1,1,1,1,0],[0,1,1,1,1,1,1]],
+      outer: [[1,0,0,0,0,0,0],[0,1,0,0,0,0,0],[0,0,1,0,0,0,0],[1,0,0,1,0,0,0],[0,1,0,0,1,0,0],[0,0,1,0,0,1,0],[0,0,0,0,0,0,1]]
+    };
+    var fp = "";
+    fp += plate("Flex-π full joint", "deploy default", true, matrix(FB, FB, FX.full_joint),
+      "joint flags all on: A reads every anchor and every future. Futures attend all streams; anchors attend all anchors.");
+    fp += plate("Flex-π action-only", "~60 ms mode", true, matrix(FB, FB, FX.action_only),
+      "joint flags all off: A reads only the three anchors. Futures still attend each other.");
+    fp += plate("Flex-π joint video only", "per-sample example", true, matrix(FB, FB, FX.joint_video),
+      "A reads V<sub>f</sub> but not S<sub>f</sub>/P<sub>f</sub>; XOR rule blocks V<sub>f</sub> ↔ S<sub>f</sub>, P<sub>f</sub>.");
+    fp += plate("Flex-π video absent", "per-sample example", true, matrix(FB, FB, FX.video_absent),
+      "cross-modal predict: V<sub>0</sub> removed, V<sub>f</sub> still denoised from S and P.");
+    fp += plate("Flex-π style, your modalities", "hypothetical", false,
+      matrix(["R_0", "D_0", "F_0", "R_f", "D_f", "F_f", "A"], ["R_0", "D_0", "F_0", "R_f", "D_f", "F_f", "A"], FX.full_joint),
+      "Same mask as Flex-π full joint with RGB / depth / flow: per-stream anchors D<sub>0</sub>, F<sub>0</sub> (not in your models today) and all-to-all futures.", true);
+    document.getElementById("flexpi").innerHTML = fp;
+    document.getElementById("flexpi_outer").innerHTML = plate("Flex-π outer layers", "HBridge, 14 of 30", true,
+      matrix(FB, FB, FX.outer), "Each stream attends only itself (first-frame causal); the action attends only itself.");
+    var MB = ["S_0", "D_0", "I_0", "T_c", "S_c", "D_c", "I_c", "T_q", "S_q", "D_q", "I_q", "A_q"];
+    document.getElementById("modar").innerHTML = plate("ModAR training mask", "12 blocks", true,
+      matrix(MB, MB, [[1,1,1,0,0,0,0,0,0,0,0,0],[1,1,1,0,0,0,0,0,0,0,0,0],[1,1,1,0,0,0,0,0,0,0,0,0],[1,1,1,1,0,0,0,0,0,0,0,0],[1,1,1,1,1,0,0,0,0,0,0,0],[1,1,1,1,1,1,0,0,0,0,0,0],[1,1,1,1,1,1,1,0,0,0,0,0],[1,1,1,0,0,0,0,1,0,0,0,0],[1,1,1,1,0,0,0,0,1,0,0,0],[1,1,1,1,1,0,0,0,0,1,0,0],[1,1,1,1,1,1,0,0,0,0,1,0],[1,1,1,1,1,1,1,0,0,0,0,1]]),
+      "History rows see history. Clean row X<sub>c</sub> sees history + clean blocks up to X. Query X<sub>q</sub> sees history + strictly earlier clean blocks + itself.");
+    var MI = ["S_0", "D_0", "I_0", "T_c", "S_c", "D_q"];
+    document.getElementById("modar_infer").innerHTML = plate("ModAR inference, stage 3 of 5", "generating D", true,
+      matrix(MI, MI, [[1,1,1,0,0,0],[1,1,1,0,0,0],[1,1,1,0,0,0],[1,1,1,1,0,0],[1,1,1,1,1,0],[1,1,1,1,1,1]]),
+      "T and S are already generated (clean, KV-cached). Only D<sub>q</sub> is denoised in this stage; I and A come next.");
+  })();
+  </script>

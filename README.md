@@ -2,14 +2,14 @@
 
 Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
 
-[![English](https://img.shields.io/badge/README-English-111111.svg)](./README.md)
-[![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d14836.svg)](./README_zh.md)
+![English](https://img.shields.io/badge/README-English-111111.svg)
+![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d14836.svg)
 
-[![arXiv](https://img.shields.io/badge/arXiv-2603.16666-b31b1b.svg)](https://arxiv.org/abs/2603.16666)
-[![Project Page](https://img.shields.io/badge/Project_Page-Fast--WAM-2ea44f.svg)](https://yuantianyuan01.github.io/FastWAM/)
-[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-f7c843)](https://huggingface.co/yuanty/fastwam)
-[![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
-[![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
+![arXiv](https://img.shields.io/badge/arXiv-2603.16666-b31b1b.svg)
+![Project Page](https://img.shields.io/badge/Project_Page-Fast--WAM-2ea44f.svg)
+![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-f7c843)
+![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)
+![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)
 
 This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
 
@@ -81,7 +81,7 @@ single model**:
 
 - **IDM mode:** imagine the future video first, then predict actions.
 - **First-frame mode (Fast-WAM):** skip test-time future imagination and predict
-  actions directly from the current observation.
+actions directly from the current observation.
 
 Download the released Optional IDM checkpoint from
 [Hugging Face](https://huggingface.co/yuanty/fastwam):
@@ -118,23 +118,29 @@ The released checkpoint, trained with action scheduler shift `1.0`, achieves
 the following success rates on the full LIBERO benchmark (40 tasks, 50 episodes
 per task):
 
-| Inference mode | Spatial | Goal | Object | Long | Average |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| IDM | 99.0% | 98.6% | 99.6% | 97.0% | **98.55%** |
-| First-frame (Fast-WAM) | 98.2% | 97.8% | 99.2% | 95.8% | **97.75%** |
+
+| Inference mode         | Spatial | Goal  | Object | Long  | Average    |
+| ---------------------- | ------- | ----- | ------ | ----- | ---------- |
+| IDM                    | 99.0%   | 98.6% | 99.6%  | 97.0% | **98.55%** |
+| First-frame (Fast-WAM) | 98.2%   | 97.8% | 99.2%  | 95.8% | **97.75%** |
+
+
+
 
 ### Other improvements
 
 - The action scheduler shift now defaults to `1.0` for both training and
-  evaluation; shifts from `1.0` to `3.0` perform similarly in our experiments.
-  When evaluating the original released checkpoints, set
-  `EVALUATION.sigma_shift=5.0` to reproduce the original setting.
+evaluation; shifts from `1.0` to `3.0` perform similarly in our experiments.
+When evaluating the original released checkpoints, set
+`EVALUATION.sigma_shift=5.0` to reproduce the original setting.
 - Upgraded LIBERO evaluation with persistent model workers, dynamic task
-  scheduling, bad-GPU quarantine, failure recovery, and resumable results.
+scheduling, bad-GPU quarantine, failure recovery, and resumable results.
 - Optimized action-only inference for IDM and Optional IDM: `infer_action`
-  returns actions and video latents directly, while VAE decoding is performed
-  only by `infer_joint` when video output is requested, eliminating redundant
-  computation in action-only deployments.
+returns actions and video latents directly, while VAE decoding is performed
+only by `infer_joint` when video output is requested, eliminating redundant
+computation in action-only deployments.
+
+
 
 ## Index
 
@@ -147,6 +153,8 @@ per task):
 - [Inference with Your Trained Checkpoints](#inference-with-your-trained-checkpoints)
 - [Acknowledgements](#acknowledgements)
 - [BibTeX](#bibtex)
+
+
 
 ## File Structure
 
@@ -173,6 +181,8 @@ FastWAM/
 └── evaluate_results/         # Inference / evaluation results
 ```
 
+
+
 ## Environment Setup
 
 ```bash
@@ -182,6 +192,8 @@ pip install -U pip
 pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
+
+
 
 ## Model Preparation
 
@@ -205,13 +217,17 @@ python scripts/preprocess_action_dit_backbone.py \
   --dtype bfloat16
 ```
 
+
+
 ## Dataset Download
+
+
 
 ### LIBERO
 
 The preprocessed LIBERO dataset used by Fast-WAM is available at:
 
-- https://huggingface.co/datasets/yuanty/LIBERO-fastwam
+- [https://huggingface.co/datasets/yuanty/LIBERO-fastwam](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
 
 Download all compressed files first, then extract them all:
 
@@ -235,11 +251,13 @@ data/libero_mujoco3.3.2/
 └── libero_spatial_no_noops_lerobot/
 ```
 
+
+
 ### RoboTwin
 
 The preprocessed RoboTwin dataset used by Fast-WAM is available at:
 
-- https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam
+- [https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
 
 Download all split archive files first, then concatenate and extract:
 
@@ -345,13 +363,15 @@ python experiments/robotwin/run_robotwin_manager.py \
   MULTIRUN.num_gpus=8
 ```
 
-For faster RoboTwin evaluation, we have enabled `EVALUATION.skip_get_obs_within_replan=true` in [`configs/sim_robotwin.yaml`](./configs/sim_robotwin.yaml).
+For faster RoboTwin evaluation, we have enabled `EVALUATION.skip_get_obs_within_replan=true` in `[configs/sim_robotwin.yaml](./configs/sim_robotwin.yaml)`.
 This skips RGB rendering while consecutively executing an action chunk within one replan window, which speeds up evaluation but makes the saved video look very low-FPS.
 Set it to `false` if you want to save a fully rendered video.
 
 **Note:** We evaluate with **unseen** instructions, following Motus. [Lingbot-VA](https://github.com/Robbyant/lingbot-va/blob/661d52a59dc634a650efcd10a79d06bbb17ea81f/evaluation/robotwin/eval_polict_client_openpi.py#L308) uses **seen** instructions instead. You can try `EVALUATION.instruction_type=seen` to use **seen** instructions, which should theoretically improve performance by one or two points.
 
 ## Training
+
+
 
 ### 1) Precompute T5 embedding cache before training
 
@@ -370,6 +390,8 @@ For multi-GPU:
 ```bash
 torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
 ```
+
+
 
 ### 2) Training (using `fastwam` as an example)
 
@@ -418,6 +440,8 @@ libero_uncond_2cam224_1e-4
 robotwin_uncond_3cam_384_1e-4
 ```
 
+
+
 ## Acknowledgements
 
 The RoboTwin evaluation code in this repository is adapted from the official [RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin). We thank the RoboTwin team for releasing their codebase and assets.
@@ -435,3 +459,33 @@ If you find our work helpful, please consider citing:
   url={https://arxiv.org/abs/2603.16666}
 }
 ```
+
+R=runs/libero_joint_2cam224_1e-4_router_full_all/; T=libero_joint_2cam224_1e-4_router_full_all
+python experiments/libero_plus/run_libero_plus_manager.py task=$T ckpt=$R/checkpoints/weights/step_021700.pt seed=42   
+  EVALUATION.dataset_stats_path=$R/dataset_stats.json MULTIRUN.num_gpus=4 EVALUATION.num_trials=1   
+  "MULTIRUN.perturbation_categories=[Noise,Layout,Background,Camera]" MULTIRUN.max_tasks_per_category=5   
+  model.router_layout=short EVALUATION.output_dir=./evaluate_results/libero_plus/${T}/{now:%Y%m%d_%H%M%S}
+python experiments/libero/run_libero_manager.py task=$T ckpt=$R/checkpoints/weights/step_021700.pt seed=42   
+  EVALUATION.dataset_stats_path=$R/dataset_stats.json MULTIRUN.num_gpus=4 EVALUATION.num_trials=50   
+  model.router_layout=short EVALUATION.output_dir=./evaluate_results/libero/${T}/{now:%Y%m%d_%H%M%S}
+
+
+
+N=4   # number of GPUs / jobs
+
+for i in $(seq 0 $((N-1))); do
+
+  CUDA_VISIBLE_DEVICES=$i nohup python scripts/precompute_depth_[flow.py](http://flow.py) \
+
+    --dataset-dir data/robotwin2.0/robotwin2.0 \
+
+    --source-key [observation.images.cam](http://observation.images.cam)_high [observation.images.cam](http://observation.images.cam)_left_wrist [observation.images.cam](http://observation.images.cam)_right_wrist \
+
+    --depth-encoder vitl --flow-clip-px 25 --flow-noise-thresh-px 0.5 \
+
+    --depth-batch-size 4 --flow-batch-size 4 --device cuda --skip-existing \
+
+    --shard-id $i --num-shards $N > logs/robotwin_depth_flow_shard$i.log 2>&1 &
+
+done
+

@@ -6,6 +6,11 @@ assets/
 runs
 runs/
 evaluate_results/
+.libero_plus/
+.deps/
+# Cloned by scripts/setup_libero_plus.sh (~20k files + optional 6GB assets).
+third_party/LIBERO-plus/
+third_party
 .deepspeed*
 error_logs/
 slurm_jobs/
@@ -30,8 +35,7 @@ text_embeds_cache/
 *.npy
 *.npz
 *.safetensors
-*.yaml
-*.yml
+
 
 volc/
 tests/
@@ -270,3 +274,14 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# Local data (1.1 TB, per-server symlinks), local envs and logs
+/data/
+/.imagemagick-env/
+MUJOCO_LOG.TXT
+
+# Keep the router-analysis tests and the attention-mask page (generic tests/ and outputs/ rules above)
+!notebooks/router_analysis/tests/
+!notebooks/router_analysis/outputs/
+notebooks/router_analysis/outputs/*
+!notebooks/router_analysis/outputs/full_all_attention_mask.html
