@@ -120,7 +120,7 @@ if [[ -n "${ACTION_MODE}" ]]; then
   EXTRA_ARGS+=( "EVALUATION.action_attend_mode=${ACTION_MODE}" )
 fi
 if [[ -n "${ACTIVE_FUTURE}" ]]; then
-  EXTRA_ARGS+=( "EVALUATION.active_future=${ACTIVE_FUTURE}" )
+  EXTRA_ARGS+=( "++EVALUATION.active_future=${ACTIVE_FUTURE}" )
 fi
 if [[ -n "${ACTIVE_FUTURE_PER_TASK}" ]]; then
   [[ -f "${ACTIVE_FUTURE_PER_TASK}" ]] || { echo "map not found: ${ACTIVE_FUTURE_PER_TASK}" >&2; exit 1; }
