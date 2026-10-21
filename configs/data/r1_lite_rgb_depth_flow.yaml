@@ -1,0 +1,56 @@
+
+train:
+  _target_: fastwam.datasets.lerobot.robot_multimodal_video_dataset.RobotMultimodalVideoDataset
+  dataset_dirs:
+    - ./data/real-world-r1-lite
+  shape_meta:
+    images:
+      # Order must match modality_camera_groups indices below.
+      - {key: image, raw_shape: [3, 640, 640], shape: [3, 240, 320]}
+      - {key: wrist_left_image, raw_shape: [3, 360, 640], shape: [3, 240, 320]}
+      - {key: wrist_right_image, raw_shape: [3, 360, 640], shape: [3, 240, 320]}
+      - {key: depth, raw_shape: [3, 640, 640], shape: [3, 240, 320]}
+      - {key: wrist_left_depth, raw_shape: [3, 360, 640], shape: [3, 240, 320]}
+      - {key: wrist_right_depth, raw_shape: [3, 360, 640], shape: [3, 240, 320]}
+      - {key: flow, raw_shape: [3, 640, 640], shape: [3, 240, 320]}
+      - {key: wrist_left_flow, raw_shape: [3, 360, 640], shape: [3, 240, 320]}
+      - {key: wrist_right_flow, raw_shape: [3, 360, 640], shape: [3, 240, 320]}
+    action: [{key: default, raw_shape: 14, shape: 14}]
+    state: [{key: default, raw_shape: 14, shape: 14}]
+  # pixel_values camera indices -> separate [C, T, 384, 320] videos (head, left wrist, right wrist)
+  modality_camera_groups:
+    rgb: [0, 1, 2]
+    depth: [3, 4, 5]
+    flow: [6, 7, 8]
+  # Unimodal future_key parity: each aux stream is [RGB_t0, modality_t>=1]
+  rgb_condition_modalities: [depth, flow]
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  skip_padding_as_possible: false
+  concat_multi_camera: robotwin
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 9
+    action_output_dim: 14
+    proprio_output_dim: 14
+    action_state_transforms: null
+    delta_action_dim_mask: null
+    use_stepwise_action_norm: false
+    norm_default_mode: z-score
+    norm_exception_mode: null
+    action_state_merger: {_target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign}
+    train_transforms:
+      - {_target_: fastwam.datasets.lerobot.transforms.image.ToTensor}
+      - {_target_: torchvision.transforms.Resize, size: [240, 320]}
+    val_transforms:
+      - {_target_: fastwam.datasets.lerobot.transforms.image.ToTensor}
+      - {_target_: torchvision.transforms.Resize, size: [240, 320]}
+  text_embedding_cache_dir: ./data/text_embeds_cache/r1_lite_tasks
+  context_len: 128

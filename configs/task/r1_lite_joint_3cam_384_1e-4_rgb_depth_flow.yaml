@@ -1,0 +1,31 @@
+# @package _global_
+# R1-Lite counterpart of the LIBERO MM run (libero_joint_2cam224_1e-4_rgb_depth_flow,
+# FastWAMJointMultimodal): all three futures denoised + trained, the action reads all of them.
+#   sequence = [R0 | R_fut | D_fut | F_fut | A]   (120 tokens / latent frame: 120 + 3*2*120 + 32 = 872)
+# Same data, batch and schedule as r1_lite_joint_3cam_384_1e-4_{random,router}_full_all*.
+
+defaults:
+  - override /data: r1_lite_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal
+  - _self_
+
+batch_size: 8
+num_workers: 8
+gradient_accumulation_steps: 4
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+EVALUATION:
+  compile_action_infer: false
+  action_attend_mode: all
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 2000
+weight_decay: 1e-2
+resume: null

@@ -1,0 +1,38 @@
+# @package _global_
+# FastWAM Joint (RGB baseline) on the RoboTwin 2.0 CLEAN demos only (2,500 episodes = 50 per task;
+# data/robotwin2.0_clean, built by scripts/make_robotwin_clean_subset.py). Otherwise identical to
+# robotwin_joint_3cam_384_1e-4 (same model, batch, schedule, norm stats of the full dataset).
+
+defaults:
+  - override /data: robotwin
+  - override /model: fastwam_joint
+  - _self_
+
+data:
+  train:
+    dataset_dirs:
+      - ./data/robotwin2.0_clean/robotwin2.0_clean
+  val:
+    dataset_dirs:
+      - ./data/robotwin2.0_clean/robotwin2.0_clean
+
+# dataloading
+batch_size: 32
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10   # 545,062 windows x 10 / (16 x 4 accum x 4 GPUs) = ~21,300 steps (LIBERO-like); 8 GPUs: accum 2
+max_steps: null
+log_every: 10
+save_every: 7500
+eval_every: 5000
+
+# training
+gradient_accumulation_steps: 1   # global batch 256 on 4 GPUs
+weight_decay: 1e-2
+resume: null

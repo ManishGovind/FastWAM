@@ -1,0 +1,31 @@
+# @package _global_
+# RoboTwin CLEAN, MM (FastWAMJointMultimodal): all three futures denoised + trained, the action
+# reads all of them. Same data split / schedule as the clean RGB baseline
+# (robotwin_joint_3cam_384_1e-4_clean): 10 epochs, global batch 256 (~21,300 steps).
+#   sequence = [R0 | R_fut | D_fut | F_fut | A]   (120 + 3*2*120 + 32 = 872 tokens)
+
+defaults:
+  - override /data: robotwin_clean_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal
+  - _self_
+
+batch_size: 8
+num_workers: 8
+gradient_accumulation_steps: 4   # global 8 x 4 x 8 GPUs = 256 (4 GPUs: accum 8)
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+EVALUATION:
+  compile_action_infer: false
+  action_attend_mode: all
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2500
+eval_every: 500
+weight_decay: 1e-2
+resume: null

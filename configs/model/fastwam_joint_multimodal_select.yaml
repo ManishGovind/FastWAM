@@ -1,0 +1,79 @@
+_target_: fastwam.runtime.create_fastwam_joint_multimodal_select
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: false
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+skip_dit_load_from_pretrain: false
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "first_frame_causal" # default
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+# Which video streams may be chosen as the active future.
+enabled_video_streams:
+  - rgb
+  - depth
+  - flow
+
+# Train-time selection over modality-specific futures:
+#   all    — every enabled future in MoT; all stream video losses
+#   random — each sample independently picks one stream; MoT is only
+#            R0 + that future + action (rgb→R0|Rf|A, depth→R0|Df|A, flow→R0|Ff|A)
+#   gt     — use offline action-error GT labels (sample['selected_modality']); no router
+#   router — learned hard pick from the same R0 + MoT context as WAM training
+#            (full R0 flatten + full context sequence; no pool/mean)
+modality_select: all
+stream_router_temperature: 1.0
+router_entropy_coef: 0.01
+router_collapse_kl: 0.1
+
+loss:
+  lambda_rgb: 1.0
+  lambda_depth: 1.0
+  lambda_flow: 1.0
+  lambda_action: 1.0

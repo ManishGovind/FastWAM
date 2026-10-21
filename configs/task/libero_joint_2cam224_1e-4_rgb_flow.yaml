@@ -1,0 +1,38 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam_rgb_flow
+  - override /model: fastwam_joint_multimodal
+  - _self_
+
+# Depth ablation: dataset omits depth cameras (~33% less image decode);
+# MoT uses [rgb, flow] only.
+batch_size: 16
+num_workers: 8
+gradient_accumulation_steps: 2
+
+model:
+  mot_checkpoint_mixed_attn: false
+  enabled_video_streams:
+    - rgb
+    - flow
+  loss:
+    lambda_depth: 0.0
+
+EVALUATION:
+  compile_action_infer: false
+  # Training-matched action attend: R0 + R_fut + F_fut (no depth tokens).
+  action_attend_mode: rgb_flow
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 10000
+eval_every: 10000
+
+# training
+weight_decay: 1e-2
+resume: null

@@ -1,0 +1,74 @@
+# @package _global_
+
+defaults:
+  - train
+  - override /task: libero_uncond_2cam224_1e-4
+  - _self_
+
+ckpt: null
+gpu_id: 0
+
+model:
+  load_text_encoder: true
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: null
+
+EVALUATION:
+  libero_plus: true
+  task_suite_name: libero_spatial
+  task_id: 0
+  # Official LIBERO-plus protocol: one episode per perturbed task.
+  num_trials: 1
+  output_dir: ./evaluate_results/libero_plus/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
+
+  # Runtime behavior
+  env_num: 1
+  num_steps_wait: 30
+  replan_steps: 10
+  binarize_gripper: true
+  use_action_ensembler: false
+  visualize_future_video: false
+  save_videos: false
+
+  # Action inference
+  action_horizon: null
+  num_inference_steps: ${eval_num_inference_steps}
+  # Per-task stream for Select models: JSON {suite: {task_id | base_task: rgb|depth|flow}}.
+  # Overrides active_future task by task (experiments/libero/eval_infer.py).
+  active_future_per_task: null
+  sigma_shift: null
+  text_cfg_scale: 1.0
+  negative_prompt: ""
+  rand_device: cpu
+  tiled: false
+  compile_action_infer: true
+
+  # MultimodalSelect: leave unset / all = all futures; rgb|depth|flow = training-matched MoT
+  # action_attend_mode: all
+  # active_future: rgb
+
+  # Optional external inputs
+  dataset_stats_path: null
+  device: cuda
+
+MULTIRUN:
+  create_only: false
+  task_file: null
+  task_suite_names:
+    - libero_10
+    - libero_goal
+    - libero_spatial
+    - libero_object
+  # null = all 7 LIBERO-plus dimensions (~10k tasks, 1 trial each).
+  # Short names: Camera, Robot, Language, Light, Background, Noise, Layout
+  perturbation_categories: null
+  # null = all variants. 5 = 5 variants x 10 base tasks x 4 suites x 7 cats.
+  max_tasks_per_category: null
+  num_gpus: 8
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

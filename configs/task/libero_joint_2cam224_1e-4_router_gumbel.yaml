@@ -1,0 +1,43 @@
+# @package _global_
+# RGB+depth+flow with a learned hard modality router trained by straight-through Gumbel.
+# Router sees the same full R0 + MoT context as FastWAM training (no pool/mean).
+
+defaults:
+  - override /data: libero_2cam_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal_select_gumbel
+  - _self_
+
+batch_size: 16
+num_workers: 8
+gradient_accumulation_steps: 2
+
+model:
+  mot_checkpoint_mixed_attn: false
+  enabled_video_streams: [rgb, depth, flow]
+  modality_select: router
+  stream_router_temperature: 1.0
+  router_entropy_coef: 0.01
+  router_collapse_kl: 0.1
+  router_gumbel_tau_start: 1.0
+  router_gumbel_tau_end: 0.5
+  router_gumbel_tau_anneal_steps: 20000
+  router_gumbel_hard: true
+  router_gumbel_video_loss: all
+  # Same HxW as data.train.video_size (R0 flatten dim).
+  router_video_size: ${data.train.video_size}
+
+EVALUATION:
+  compile_action_infer: false
+  # When modality_select=router, infer uses router argmax (active_future).
+  # Override with action_attend_mode for ablations without the router.
+  action_attend_mode: all
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 10000
+eval_every: 10000
+weight_decay: 1e-2
+resume: null

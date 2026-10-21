@@ -1,0 +1,51 @@
+# @package _global_
+# Full layout, video loss on ALL futures, action reads ONE future chosen by the learned router.
+# Router counterpart of libero_joint_2cam224_1e-4_random_full_all (identical except selection).
+#   sequence  = [R0 | R_fut | D_fut | F_fut | A]           (MM layout, 718 tokens)
+#   video     : all three futures denoised + trained every sample (= MM's video supervision)
+#   action    : sees R0 + the router's future (one-hot gate on the action rows)
+#   router    : REINFORCE on the action loss, timestep_ema baseline, warm-up 2000 steps
+#               (uniform picks, no router loss), same settings as router_short_m_context_video
+#   context   : plain [instruction | proprio] (no modality sentence; one context cannot
+#               condition three slots)
+
+defaults:
+  - override /data: libero_2cam_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal_select_new
+  - _self_
+
+batch_size: 8
+num_workers: 8
+gradient_accumulation_steps: 4
+
+model:
+  mot_checkpoint_mixed_attn: false
+  enabled_video_streams: [rgb, depth, flow]
+  modality_select: router
+  stream_router_temperature: 1.0
+  router_entropy_coef: 0.01
+  router_collapse_kl: 0.1
+  router_warmup_steps: 2000
+  router_reward: action
+  router_baseline: timestep_ema
+  router_adv_normalize: true
+  router_video_size: ${data.train.video_size}
+  router_layout: full
+  router_video_loss: all
+  modality_prompt: false
+  stream_embedding: true      # per-stream identity (adaLN), init randn*0.02; trained from scratch, 21700 steps like router_full_all
+  router_input: embed         # router reads the video expert's patch/text embeddings (detached)
+
+EVALUATION:
+  compile_action_infer: false
+  # No active_future: the router picks the stream at every replan.
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 10000
+eval_every: 10000
+weight_decay: 1e-2
+resume: null

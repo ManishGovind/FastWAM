@@ -1,0 +1,126 @@
+# _new inline-router variant (see src/fastwam/models/wan22/fastwam_joint_multimodal_select_new.py)
+_target_: fastwam.runtime_new.create_fastwam_joint_multimodal_select_new
+model_id: Wan-AI/Wan2.2-TI2V-5B
+tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+tokenizer_max_len: 128
+load_text_encoder: false
+proprio_dim: ${data.train.processor.proprio_output_dim}
+redirect_common_files: false
+mot_checkpoint_mixed_attn: true
+action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+skip_dit_load_from_pretrain: false
+
+video_dit_config:
+  has_image_input: false
+  patch_size: [1, 2, 2]
+  in_dim: 48
+  hidden_dim: 3072
+  ffn_dim: 14336
+  freq_dim: 256
+  text_dim: 4096
+  out_dim: 48
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  eps: 1.0e-06
+  seperated_timestep: true
+  require_clip_embedding: false
+  require_vae_embedding: false
+  fuse_vae_embedding_in_latents: true
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  video_attention_mask_mode: "first_frame_causal" # default
+  action_conditioned: false
+  action_dim: ${data.train.processor.action_output_dim}
+  action_group_causal_mask_mode: "group_diagonal"
+
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers: 30
+  text_dim: 4096
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+# Which video streams may be chosen as the active future.
+enabled_video_streams:
+  - rgb
+  - depth
+  - flow
+
+# Train-time selection over modality-specific futures:
+#   all    — every enabled future in MoT; all stream video losses
+#   random — each sample independently picks one stream; MoT is only
+#            R0 + that future + action (rgb→R0|Rf|A, depth→R0|Df|A, flow→R0|Ff|A)
+#   gt     — use offline action-error GT labels (sample['selected_modality']); no router
+#   router — learned hard pick from the same R0 + MoT context as WAM training
+#            (full R0 flatten + full context sequence; no pool/mean)
+modality_select: all
+stream_router_temperature: 1.0
+router_entropy_coef: 0.01
+router_collapse_kl: 0.1
+# Inline router (_new only):
+#   router_reward    action — REINFORCE reward = weighted action loss (matches the oracle)
+#                    task   — video (x video_weight) + action, as in loss_total
+#   router_baseline  batch        — batch-mean baseline
+#                    timestep_ema — running mean reward per action-noise bucket
+router_reward: action
+router_baseline: batch
+router_baseline_bins: 10
+router_baseline_momentum: 0.99
+router_adv_normalize: true
+# Router warm-up (optimizer steps): uniform random routing, router frozen (loss x0).
+# 0 = off. router_grad_accum converts training_loss calls to optimizer steps.
+router_warmup_steps: 0
+router_grad_accum: ${gradient_accumulation_steps}
+# Router layout (REINFORCE / random / gt in the _new model):
+#   short — [R0 | chosen future | A] (current behaviour)
+#   full  — [R0 | R_fut | D_fut | F_fut | A]; one-hot mask: the action sees R0 + chosen future
+# router_video_loss (full only): chosen — video loss on the chosen future; all — on every future
+router_layout: short
+router_video_loss: chosen
+# Modality condition: tells the MoT (video + action cross-attention) which stream to predict.
+#   joint    — T5("<instruction> Predict the depth video.") -> [combined | proprio]  (reference WAM paper)
+#   separate — [instruction | T5(condition) | proprio]
+# Cache once (both modes): python scripts/precompute_modality_text_embeds.py task=<task>
+modality_prompt: false
+modality_prompt_mode: joint
+# Which expert reads the condition: both (paper) | video (action expert keeps [instruction | proprio])
+modality_prompt_target: both
+modality_prompt_sentences:
+  rgb: Predict the RGB video.
+  depth: Predict the depth video.
+  flow: Predict the flow video.
+# Separate folder for the modality-condition caches (change freely).
+modality_prompt_cache_dir: ./data/text_embeds_cache/libero_modality
+modality_prompt_context_len: ${data.train.context_len}
+# Required when modality_select=router — must match data video HxW for R0 dim.
+router_video_size: ${data.train.video_size}
+
+loss:
+  lambda_rgb: 1.0
+  lambda_depth: 1.0
+  lambda_flow: 1.0
+  lambda_action: 1.0
+# Learned per-stream identity added to the adaLN timestep embedding of future tokens (init randn*0.02).
+stream_embedding: false
+# Router input: raw (flattened R0 latent + T5/proprio) | embed (video expert's patch/text embeddings, detached).
+router_input: raw
+# Router architecture on the embed inputs: mlp (EmbedModalityRouter) | transformer (TransformerModalityRouter).
+router_arch: mlp
+# Embed router also reads the RGB observation history (needs data.train.image_history_frames > 0).
+router_history: false
+router_history_frames: ${oc.select:data.train.image_history_frames,8}

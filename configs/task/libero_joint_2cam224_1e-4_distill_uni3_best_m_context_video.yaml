@@ -1,0 +1,51 @@
+# @package _global_
+# Context model (random_short_m_context_video) + action distillation from 3 frozen unimodal teachers.
+#   student : [R0 | chosen future | A], stream random per sample, video expert told
+#             "<instruction> Predict the <stream> video." (joint, target = video)
+#   teachers: unimodal joint RGB / Depth / Flow (each [R0 | own future | A]), frozen,
+#             run on the student's own noisy action / timesteps / noisy future latents
+#   target  : per sample, the teacher closest to the demonstration (distill_select: best)
+#   loss    : student loss + distill_lambda * w(t_a) * || v_student - v_best_teacher ||^2
+# Model code: src/fastwam/models/wan22/fastwam_joint_multimodal_select_distill.py
+# Factory   : src/fastwam/runtime_distill.py
+
+defaults:
+  - override /data: libero_2cam_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal_select_new
+  - _self_
+
+batch_size: 16
+num_workers: 8
+gradient_accumulation_steps: 2
+
+model:
+  _target_: fastwam.runtime_distill.create_fastwam_joint_multimodal_select_distill
+  mot_checkpoint_mixed_attn: false
+  enabled_video_streams: [rgb, depth, flow]
+  modality_select: random
+  router_layout: short
+  modality_prompt: true
+  modality_prompt_mode: joint
+  modality_prompt_target: video
+  distill_teachers:
+    rgb: {run: runs/libero_joint_2cam224_1e-4/2026-08-23_17-22-15, step: 21700}
+    depth: {run: runs/libero_joint_2cam224_1e-4_depth/2026-08-21_23-21-22, step: 21700}
+    flow: {run: runs/libero_joint_2cam224_1e-4_flow/2026-08-22_14-11-53, step: 21000}  # the checkpoint used in its evals
+  distill_lambda: 1.0
+  distill_select: best          # best | mean
+  distill_timestep_weight: true
+
+EVALUATION:
+  compile_action_infer: false
+  # Evaluated exactly like the context model (teachers are not loaded at eval).
+  active_future: random
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 10000
+eval_every: 10000
+weight_decay: 1e-2
+resume: null
