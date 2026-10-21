@@ -5,11 +5,18 @@ For each FastWAM training window start, run RGB / Depth / Flow ``infer_action``
 
 Training alignment
 ------------------
-Window starts match ``RobotVideoDataset.__getitem__(idx)``:
+Window starts match ``RobotMultimodalVideoDataset`` / ``RobotVideoDataset`` ``__getitem__(idx)``:
 
     range(ep_from, ep_to - obs_size + 1, global_sample_stride)
 
 All episodes with ``length >= obs_size`` are included.
+
+Oracle labels (``label``, ``frame_idx``) are what ``train_modality_router.py`` needs.
+Router features are **not** required in ``labels_*.pt`` anymore: that script loads
+RGB-only training samples and runs ``FastWAM.build_inputs`` live.
+
+Optional RGB-shard features (``r0_pool`` / ``context_mean``) remain for analyze
+exports / knn assets only.
 
 Usage
 -----
@@ -20,6 +27,9 @@ Usage
     # After RGB + Depth + Flow shards exist:
     python notebooks/modality_action_labels.py --analyze --frame-stride 1 --seeds 42 43 44
     python notebooks/modality_action_labels.py --verify  --frame-stride 1 --seeds 42 43 44
+
+    # Train router from samples + oracle labels (no context_mean in labels needed):
+    python notebooks/train_modality_router.py --labels notebooks/outputs/.../labels_....pt
 """
 
 from __future__ import annotations
@@ -40,13 +50,19 @@ from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from hydra import compose, initialize_config_dir  # noqa: E402
+from hydra.core.global_hydra import GlobalHydra  # noqa: E402
+from hydra.utils import instantiate  # noqa: E402
+
 from repr_analysis import (  # noqa: E402
     JOINT_UNIMODAL,
     REPO,
     compose_task_cfg,
-    load_dataset,
     load_joint_model,
 )
+
+# Same LeRobot index as multimodal train, but only 2 RGB cameras in each sample.
+LABEL_DATA_CONFIG = "libero_2cam_rgb_only"
 
 OUT_DIR = REPO / "notebooks" / "outputs" / "modality_action_labels"
 MODELS = ("RGB", "Depth", "Flow")
@@ -119,12 +135,22 @@ def expected_windows(dataset, n_episodes: int, stride: int) -> dict[tuple[int, i
     return out
 
 
+def load_label_dataset(stats_path: Path):
+    """Training-aligned windows; sample dict has ``video`` (+ action/proprio/context) only."""
+    data_dir = str((REPO / "configs" / "data").resolve())
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base="1.3", config_dir=data_dir):
+        cfg = compose(config_name=f"{LABEL_DATA_CONFIG}.yaml")
+    dataset = instantiate(cfg.train, pretrained_norm_stats=str(stats_path))
+    return cfg, dataset
+
+
 def load_rgb_dataset():
-    """LIBERO train set used by unimodal RGB (same dirs / obs_size as multimodal)."""
+    """LIBERO label/collect dataset (RGB-only samples, same indices as multimodal train)."""
     spec = JOINT_UNIMODAL["RGB"]
-    cfg = compose_task_cfg(spec["task"])
-    dataset = load_dataset(cfg, Path(spec["run_dir"]) / "dataset_stats.json")
-    return cfg, dataset, spec
+    _cfg, dataset = load_label_dataset(Path(spec["run_dir"]) / "dataset_stats.json")
+    return _cfg, dataset, spec
 
 
 def load_shard_records(model: str, tag: str) -> tuple[dict[tuple[int, int], dict], dict[str, Any]]:
@@ -146,10 +172,76 @@ def _load(model: str, tag: str):
     return load_shard_records(model, tag)
 
 
-def _router_features(sample: dict[str, Any], r0_latent: torch.Tensor) -> dict[str, np.ndarray]:
+def _sample_video(sample: dict[str, Any]) -> torch.Tensor:
+    """RGB window tensor ``[3,T,H,W]`` (unimodal ``video`` or multimodal ``video_rgb``)."""
+    if "video" in sample:
+        video = sample["video"]
+    elif "video_rgb" in sample:
+        video = sample["video_rgb"]
+    else:
+        raise KeyError("sample needs `video` or `video_rgb`")
+    if video.ndim != 4 or video.shape[0] != 3:
+        raise ValueError(f"expected video [3,T,H,W], got {tuple(video.shape)}")
+    return video
+
+
+@torch.no_grad()
+def _encode_r0_latent_training(model, sample: dict[str, Any]) -> torch.Tensor:
+    """R0 latent as in FastWAM / multimodal ``training_loss``.
+
+    Training encodes the **full** obs window with ``_encode_video_latents`` and takes
+    ``latents[:, :, 0]`` (see ``FastWAM.build_inputs`` /
+    ``FastWAMJointMultimodal._encode_stream_latents`` +
+    ``r0_latent=stream_latents['rgb'][:, :, 0]``). This differs from
+    ``_encode_input_image_latents_tensor`` (single-frame encode used at infer).
+    """
+    video = _sample_video(sample).unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+    latents = model._encode_video_latents(video, tiled=False)  # [1,C,Lt,h,w]
+    return latents[:, :, 0]  # [1,C,h,w]
+
+
+@torch.no_grad()
+def _build_context_after_proprio(
+    model, sample: dict[str, Any]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match ``build_inputs`` / ``_build_shared_context_action`` proprio append.
+
+    Uses ``proprio[:, 0]`` (first obs frame), cached T5 ``context``/``context_mask``,
+    then ``model._append_proprio_to_context``.
+    """
+    device, dtype = model.device, model.torch_dtype
+    context = sample["context"]
+    context_mask = sample["context_mask"]
+    proprio = sample["proprio"]
+    if context.ndim == 2:
+        context = context.unsqueeze(0)
+    if context_mask.ndim == 1:
+        context_mask = context_mask.unsqueeze(0)
+    if proprio.ndim == 2:
+        proprio = proprio.unsqueeze(0)
+    if proprio.ndim != 3:
+        raise ValueError(f"`proprio` must be [T,d] or [B,T,d], got {tuple(proprio.shape)}")
+
+    context = context.to(device=device, dtype=dtype)
+    context_mask = context_mask.to(device=device, dtype=torch.bool)
+    # Same as training: only the t0 proprio token is appended.
+    proprio0 = proprio[:, 0, :].to(device=device, dtype=dtype)
+    return model._append_proprio_to_context(context, context_mask, proprio0)
+
+
+def _router_features_training(model, sample: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Router inputs identical to in-graph ``_build_router_features`` at train time."""
+    r0 = _encode_r0_latent_training(model, sample)  # [1,C,h,w]
+    context, context_mask = _build_context_after_proprio(model, sample)
+    r0_pool = F.adaptive_avg_pool2d(r0.float(), 2).flatten(1)[0]
+    w = context_mask.to(dtype=torch.float32).unsqueeze(-1)
+    context_mean = (context.float() * w).sum(1) / w.sum(1).clamp(min=1.0)
+    proprio = sample["proprio"]
+    proprio0 = proprio[0] if proprio.ndim == 2 else proprio[0, 0]
     return {
-        "r0_pool": F.adaptive_avg_pool2d(r0_latent[None], 2).flatten().cpu().numpy().astype(np.float16),
-        "proprio": sample["proprio"][0].float().numpy(),
+        "r0_pool": r0_pool.cpu().numpy().astype(np.float16),
+        "proprio": proprio0.float().cpu().numpy(),
+        "context_mean": context_mean.squeeze(0).cpu().numpy().astype(np.float16),
     }
 
 
@@ -161,12 +253,8 @@ def _text_mean(sample: dict[str, Any]) -> np.ndarray:
 
 
 def _context_mean(model, sample: dict[str, Any]) -> np.ndarray:
-    """Same as in-graph ``_build_router_features``: mean of MoT context after proprio append."""
-    device, dtype = model.device, model.torch_dtype
-    context = sample["context"].unsqueeze(0).to(device=device, dtype=dtype)
-    context_mask = sample["context_mask"].unsqueeze(0).to(device=device, dtype=torch.bool)
-    proprio = sample["proprio"][0].unsqueeze(0).to(device=device, dtype=dtype)
-    context, context_mask = model._append_proprio_to_context(context, context_mask, proprio)
+    """Masked mean of MoT context after proprio append (training-aligned)."""
+    context, context_mask = _build_context_after_proprio(model, sample)
     w = context_mask.to(dtype=torch.float32).unsqueeze(-1)
     mean = (context.float() * w).sum(1) / w.sum(1).clamp(min=1.0)
     return mean.squeeze(0).cpu().numpy().astype(np.float16)
@@ -180,8 +268,13 @@ def _context_mean(model, sample: dict[str, Any]) -> np.ndarray:
 @torch.no_grad()
 def sample_actions(
     model, samples: list[dict[str, Any]], seeds: tuple[int, ...], cfg
-) -> tuple[np.ndarray, torch.Tensor]:
-    """Batched ``infer_action``. Returns ``actions [B, S, H, D]``, R0 latents ``[B, C, h, w]``."""
+) -> np.ndarray:
+    """Batched joint ``infer_action``. Returns ``actions [B, S, H, D]``.
+
+    Denoising still conditions on a **single-frame** VAE encode (same as
+    ``infer_action``). Router features are computed separately via
+    ``_router_features_training`` so they match the training loop.
+    """
     n, n_seeds = len(samples), len(seeds)
     num_frames = int(cfg.data.train.num_frames)
     horizon = num_frames - 1
@@ -191,16 +284,21 @@ def sample_actions(
     shift = None if shift is None else float(shift)
     dtype, device = model.torch_dtype, model.device
 
+    # Infer path: single-frame encode (matches FastWAMJoint.infer_action).
     first = torch.cat([
         model._encode_input_image_latents_tensor(
-            s["video"][:, 0].unsqueeze(0).to(device, dtype)
+            _sample_video(s)[:, 0].unsqueeze(0).to(device, dtype)
         )
         for s in samples
     ])
-    context = torch.stack([s["context"] for s in samples]).to(device, dtype)
-    context_mask = torch.stack([s["context_mask"] for s in samples]).to(device, torch.bool)
-    proprio = torch.stack([s["proprio"][0] for s in samples]).to(device, dtype)
-    context, context_mask = model._append_proprio_to_context(context, context_mask, proprio)
+    # Context path: same proprio append as training ``_build_shared_context_action``.
+    contexts, masks = [], []
+    for s in samples:
+        ctx, msk = _build_context_after_proprio(model, s)
+        contexts.append(ctx)
+        masks.append(msk)
+    context = torch.cat(contexts, dim=0)
+    context_mask = torch.cat(masks, dim=0)
 
     _, c, _, h, w = first.shape
     lt = (num_video_frames - 1) // model.vae.temporal_downsample_factor + 1
@@ -248,8 +346,7 @@ def sample_actions(
         latents_action = model.infer_action_scheduler.step(pred_a, da, latents_action)
         latents_video[:, :, 0:1] = first_r
 
-    actions = latents_action.float().view(n, n_seeds, horizon, -1).cpu().numpy()
-    return actions, first[:, :, 0].float()
+    return latents_action.float().view(n, n_seeds, horizon, -1).cpu().numpy()
 
 
 def collect(
@@ -269,7 +366,7 @@ def collect(
 
     spec = JOINT_UNIMODAL[model_name]
     cfg = compose_task_cfg(spec["task"])
-    dataset = load_dataset(cfg, Path(spec["run_dir"]) / "dataset_stats.json")
+    _, dataset = load_label_dataset(Path(spec["run_dir"]) / "dataset_stats.json")
     obs = int(dataset.lerobot_dataset.obs_size)
     train_stride = int(getattr(dataset.lerobot_dataset, "global_sample_stride", 1))
     stride = frame_stride if frame_stride > 0 else train_stride
@@ -342,7 +439,7 @@ def collect(
     for samples in loader:
         meta = todo[pos: pos + len(samples)]
         pos += len(samples)
-        actions, r0 = sample_actions(model, samples, seeds, cfg)
+        actions = sample_actions(model, samples, seeds, cfg)
         for j, (ep, w, idx, progress) in enumerate(meta):
             pad = samples[j].get("action_is_pad")
             rec: dict[str, Any] = {
@@ -356,9 +453,8 @@ def collect(
             }
             if save_features:
                 prompt = samples[j].get("prompt")
-                rec["features"] = _router_features(samples[j], r0[j])
-                # Inline router feature: masked mean of context after proprio append.
-                rec["features"]["context_mean"] = _context_mean(model, samples[j])
+                # Training-aligned R0 (full-window VAE) + context after proprio append.
+                rec["features"] = _router_features_training(model, samples[j])
                 rec["prompt"] = prompt
                 if prompt not in state["text_features"]:
                     state["text_features"][prompt] = _text_mean(samples[j])
@@ -394,7 +490,7 @@ def _backfill_context_mean(frame_idxs: np.ndarray, *, batch_size: int = 64) -> n
     """Recompute in-graph ``context_mean`` for labeled window starts (RGB model + dataset)."""
     spec = JOINT_UNIMODAL["RGB"]
     cfg = compose_task_cfg(spec["task"])
-    dataset = load_dataset(cfg, Path(spec["run_dir"]) / "dataset_stats.json")
+    _, dataset = load_label_dataset(Path(spec["run_dir"]) / "dataset_stats.json")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_joint_model(cfg, Path(spec["ckpt"]), device=device)
     out = np.zeros((len(frame_idxs), int(getattr(model, "text_dim", 4096))), dtype=np.float32)
