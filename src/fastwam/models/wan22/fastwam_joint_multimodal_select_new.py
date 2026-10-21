@@ -65,7 +65,7 @@ from .fastwam_joint_multimodal import (
     FastWAMJointMultimodal,
     _STREAM_KEYS,
 )
-from .modality_router_new import EmbedModalityRouter, ModalityRouter, collapse_kl
+from .modality_router_new import EmbedModalityRouter, ModalityRouter, TransformerModalityRouter, collapse_kl
 
 logger = get_logger(__name__)
 
@@ -122,8 +122,14 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # Router also reads the RGB observation history (embed router only; data: image_history_frames).
         router_history = bool(kwargs.pop("router_history", False))
         router_history_frames = int(kwargs.pop("router_history_frames", 8) or 8)
+        # Router architecture on the embed inputs: "mlp" (EmbedModalityRouter) | "transformer".
+        router_arch = str(kwargs.pop("router_arch", "mlp")).lower()
         if router_input not in ("raw", "embed"):
             raise ValueError(f"`router_input` must be 'raw' or 'embed', got {router_input!r}")
+        if router_arch not in ("mlp", "transformer"):
+            raise ValueError(f"`router_arch` must be 'mlp' or 'transformer', got {router_arch!r}")
+        if router_arch == "transformer" and (router_input != "embed" or router_history):
+            raise ValueError("`router_arch: transformer` requires `router_input: embed` and no `router_history`.")
         if modality_prompt_target not in MODALITY_PROMPT_TARGETS:
             raise ValueError(
                 f"`modality_prompt_target` must be one of {MODALITY_PROMPT_TARGETS}, got {modality_prompt_target!r}"
@@ -174,6 +180,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.router_layout = router_layout
         model.router_video_loss = router_video_loss
         model.router_input = router_input
+        model.router_arch = router_arch
         model.router_history = router_history
         model.router_history_frames = router_history_frames   # = data.train.image_history_frames
         if router_history and router_input != "embed":
@@ -272,6 +279,16 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         if getattr(model, "router_input", "raw") == "embed":
             if getattr(model, "proprio_encoder", None) is None:
                 raise ValueError("router_input=embed expects the proprio token as the last context token.")
+            if getattr(model, "router_arch", "mlp") == "transformer":
+                ve = model.video_expert
+                up = int(getattr(model.vae, "upsampling_factor", 16))
+                _, ph, pw = (int(p) for p in ve.patch_size)
+                n = (int(video_size[0]) // up // ph) * (int(video_size[1]) // up // pw)
+                router = TransformerModalityRouter(
+                    dim=int(ve.hidden_dim), num_classes=len(enabled), num_r0_tokens=n, hidden=hidden, dropout=dropout,
+                ).to(device=model.device, dtype=torch.float32)
+                logger.info("Built TransformerModalityRouter classes=%s dim=%d r0_tokens=%d", list(enabled), router.dim, n)
+                return router
             router = EmbedModalityRouter(
                 dim=int(model.video_expert.hidden_dim), num_classes=len(enabled), hidden=hidden, dropout=dropout,
                 history=bool(getattr(model, "router_history", False)),
