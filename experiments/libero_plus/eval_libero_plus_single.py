@@ -36,6 +36,7 @@ from experiments.libero.eval_infer import (
     call_action_infer,
     plus_base_task,
     validate_eval_infer_model,
+    RouterHistoryBuffer,
 )
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
@@ -381,6 +382,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    history_images: Optional[torch.Tensor] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -417,6 +419,8 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if history_images is not None:
+        infer_kwargs["history_images"] = history_images
     action_attend_mode = cfg.EVALUATION.get("action_attend_mode", None)
     if action_attend_mode is not None:
         infer_kwargs["action_attend_mode"] = str(action_attend_mode)
@@ -506,6 +510,9 @@ def run_single_episode(
 
     env.reset()
     obs = env.set_init_state(initial_state)
+    history = RouterHistoryBuffer(model, cfg, lambda o: _obs_to_model_input(
+        o, cfg=cfg, processor=processor, width=input_w, height=input_h,
+        device=model_device, dtype=model.torch_dtype)[0][0])
     if use_action_ensembler:
         ensembler = ActionEnsembler()
         ensembler.reset()
@@ -529,6 +536,7 @@ def run_single_episode(
             t += 1
             continue
 
+        history.push(obs)
         if len(pending_actions) == 0:
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
@@ -540,6 +548,7 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                history_images=history.clip(),
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1

@@ -1,8 +1,9 @@
 """Closed-loop LIBERO eval where a per-replan modality choice picks which unimodal joint model acts.
 
 Drivers (all three unimodal models are loaded; only the chosen one is run at each replan):
-  router  the offline-trained router (`notebooks/train_modality_router.py`, soft CE, all features)
-          applied to the live observation: pooled R0 VAE latent, normalized proprio, instruction.
+  router  the offline-trained router (`notebooks/train_modality_router.py`, hard CE)
+          applied to the live observation with the same features as the in-graph router:
+          pooled R0 VAE latent + ``context_mean`` (MoT context after proprio append).
   gt_knn  the action-error label of the nearest demo window of the same task, nearest by the
           same R0 latent + proprio features. This is the closest available stand-in for the
           ground-truth label once the rollout leaves the demo states.
@@ -68,10 +69,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 LABEL_DIR = project_root / "notebooks" / "outputs" / "modality_action_labels"
-LABELS = LABEL_DIR / "labels_epall_stride4_s0-1-2-3_grip0.2269.pt"
-ROUTERS = LABEL_DIR / "routers.pt"
+LABELS = LABEL_DIR / "labels_epall_stride1_s42-43-44_grip0.2148.pt"
+ROUTERS = LABEL_DIR / "routers_hard_stride1.pt"
 ASSETS = LABEL_DIR / "router_eval_assets.pt"
-ROUTER_NAME = "router soft CE (all feats)"
+ROUTER_NAME = "router hard CE (all feats)"
 SELECTORS = ("router", "gt_knn")
 DRIVERS = SELECTORS + MODELS  # a model name drives with that expert alone (pipeline check / control)
 SUITES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
@@ -89,19 +90,38 @@ def norm_task(text: str) -> str:
 
 def build_assets() -> dict[str, Any]:
     """Per-task instruction features and kNN index, plus the router, in one small file."""
-    from modality_action_labels import _load, _tag
+    from modality_action_labels import load_shard_records, run_tag
+    from repr_analysis import JOINT_UNIMODAL, compose_task_cfg, load_dataset
 
     d = torch.load(LABELS, map_location="cpu", weights_only=False)
-    recs, _ = _load("RGB", _tag(0, 8, 4, (0, 1, 2, 3)))
+    # Prefer stride-1 shards if present; fall back to whatever tag is in LABELS path.
+    tag = "epall_stride1_s42-43-44"
+    try:
+        recs, _ = load_shard_records("RGB", tag)
+    except Exception:
+        recs, _ = load_shard_records("RGB", run_tag(0, 4, (0, 1, 2, 3)))
     tasks = np.array([norm_task((recs[k]["prompt"] or "").split("instruction:")[-1]) for k in d["keys"]])
-    r0, pr = d["r0_pool"].astype(np.float32), d["proprio"].astype(np.float32)
+    r0 = np.asarray(d["r0_pool"], dtype=np.float32)
+    pr = np.asarray(d["proprio"], dtype=np.float32)
     knn_norm = {"r0_pool": (r0.mean(0), r0.std(0) + 1e-6), "proprio": (pr.mean(0), pr.std(0) + 1e-6)}
+
+    # Full cached T5 context per task (experts load without text encoder).
+    spec = JOINT_UNIMODAL["RGB"]
+    cfg = compose_task_cfg(spec["task"])
+    dataset = load_dataset(cfg, Path(spec["run_dir"]) / "dataset_stats.json")
+    frame_idxs = np.asarray(d["frame_idx"])
     per_task = {}
     for t in np.unique(tasks):
-        sel = tasks == t
+        sel = np.where(tasks == t)[0]
+        sample = dataset[int(frame_idxs[sel[0]])]
         per_task[t] = {
-            "text_mean": d["text_mean"][sel][0].astype(np.float32),
-            "r0_pool": r0[sel], "proprio": pr[sel], "label": d["label"][sel].astype(np.int64),
+            "text_mean": np.asarray(d["text_mean"][sel[0]], dtype=np.float32),
+            "context": sample["context"].float().numpy(),
+            "context_mask": sample["context_mask"].bool().numpy(),
+            "prompt": sample.get("prompt"),
+            "r0_pool": r0[sel],
+            "proprio": pr[sel],
+            "label": np.asarray(d["label"][sel], dtype=np.int64),
         }
     routers = torch.load(ROUTERS, map_location="cpu", weights_only=False)
     assets = {"tasks": per_task, "knn_norm": knn_norm, "router": routers["routers"][ROUTER_NAME],
@@ -144,21 +164,43 @@ class Selector:
                            v["label"])
 
     @torch.no_grad()
-    def features(self, obs, cfg, processor, input_w: int, input_h: int) -> dict[str, np.ndarray]:
+    def features(self, obs, cfg, processor, input_w: int, input_h: int, task: str) -> dict[str, np.ndarray]:
         image, proprio, _ = _obs_to_model_input(obs, cfg=cfg, processor=processor, width=input_w, height=input_h,
                                                 device=self.device, dtype=self.rgb_model.torch_dtype)
         z = self.rgb_model._encode_input_image_latents_tensor(input_image=image)  # [1, C, 1, h, w]
         r0 = F.adaptive_avg_pool2d(z[:, :, 0].float(), 2).flatten(1)[0]
-        return {"r0_pool": r0.cpu().numpy(), "proprio": proprio.reshape(-1).float().cpu().numpy()}
+        # Same as offline/in-graph: cached T5 context + proprio token → masked mean.
+        task_assets = self.assets["tasks"][task]
+        context = torch.as_tensor(task_assets["context"], dtype=self.rgb_model.torch_dtype, device=self.device)[None]
+        context_mask = torch.as_tensor(task_assets["context_mask"], dtype=torch.bool, device=self.device)[None]
+        prop = proprio.reshape(1, -1).to(device=self.device, dtype=self.rgb_model.torch_dtype)
+        context, context_mask = self.rgb_model._append_proprio_to_context(context, context_mask, prop)
+        w = context_mask.to(dtype=torch.float32).unsqueeze(-1)
+        context_mean = ((context.float() * w).sum(1) / w.sum(1).clamp(min=1.0))[0]
+        return {
+            "r0_pool": r0.cpu().numpy(),
+            "proprio": proprio.reshape(-1).float().cpu().numpy(),
+            "context_mean": context_mean.cpu().numpy(),
+        }
 
     @torch.no_grad()
     def choose(self, driver: str, feats: dict[str, np.ndarray], task: str) -> tuple[int, np.ndarray]:
         if driver == "router":
-            x = dict(feats, text_mean=self.assets["tasks"][task]["text_mean"])
-            inp = {g: (torch.as_tensor(x[g], dtype=torch.float32, device=self.device)[None] - self.norm[g][0])
+            missing = [g for g in self.groups if g not in feats]
+            if missing:
+                raise KeyError(f"router feats missing {missing}; have {list(feats)}")
+            missing_norm = [g for g in self.groups if g not in self.norm]
+            if missing_norm:
+                raise KeyError(
+                    f"feature_norm missing {missing_norm}; have {list(self.norm)}. "
+                    "Retrain/export routers with matching groups, or rebuild assets."
+                )
+            inp = {g: (torch.as_tensor(feats[g], dtype=torch.float32, device=self.device)[None] - self.norm[g][0])
                    / self.norm[g][1] for g in self.groups}
-            prob = torch.softmax(self.router(inp), -1)[0].cpu().numpy()
-            return int(prob.argmax()), prob
+            # Same hard deploy path as ModalityRouter.route_offline (keep probs for logging).
+            logits = self.router(inp)
+            prob = torch.softmax(logits, -1)[0].cpu().numpy()
+            return int(logits.argmax(dim=-1).item()), prob
         if driver == "gt_knn":
             kn = self.assets["knn_norm"]
             q_r0 = ((feats["r0_pool"] - kn["r0_pool"][0]) / kn["r0_pool"][1]) / np.sqrt(feats["r0_pool"].shape[0])
@@ -219,7 +261,9 @@ def run_episode(env, initial_state, task_description: str, *, driver: str, selec
             if driver in MODELS:
                 m, info = MODELS.index(driver), np.zeros(0)
             else:
-                feats = selector.features(obs, base["cfg"], base["processor"], base["input_w"], base["input_h"])
+                feats = selector.features(
+                    obs, base["cfg"], base["processor"], base["input_w"], base["input_h"], lookup
+                )
                 m, info = selector.choose(driver, feats, lookup)
             picks.append(m)
             extra.append(info.tolist())

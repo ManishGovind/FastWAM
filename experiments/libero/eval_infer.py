@@ -257,3 +257,35 @@ def call_action_infer(
         if key in sig.parameters and key in extra:
             filtered[key] = extra[key]
     return infer_method(**filtered)
+
+
+class RouterHistoryBuffer:
+    """Per-episode RGB history for ``router_history`` models (no-op for every other model).
+
+    Matches training (data.train.image_history_frames = H): frames t-(H+1)*s (VAE lead-in), t-H*s,
+    .., t-s -- R0 (frame t) is not included -- with s = action_video_freq_ratio * global_sample_stride
+    env steps; before the episode has that many steps the first policy frame is repeated (LeRobot
+    clamps to the episode start the same way).
+    ``to_image(obs)`` must build the model input exactly like the R0 image ([3, H, W] in [-1, 1]).
+    """
+
+    def __init__(self, model, cfg, to_image):
+        data = cfg.data.train
+        self.n = int(data.get("image_history_frames", 0) or 0)
+        self.s = int(data.get("action_video_freq_ratio", 1)) * int(data.get("global_sample_stride", 1))
+        self.on = bool(getattr(model, "router_history", False)) and self.n > 0
+        self.to_image = to_image
+        self.frames = []
+
+    def push(self, obs) -> None:
+        if self.on:
+            self.frames.append(self.to_image(obs))
+
+    def clip(self):
+        """[3, H+1, h, w] or None."""
+        if not self.on or not self.frames:
+            return None
+        import torch
+        last = len(self.frames) - 1
+        return torch.stack([self.frames[max(0, last - k * self.s)] for k in range(self.n + 1, 0, -1)], dim=1)
+
