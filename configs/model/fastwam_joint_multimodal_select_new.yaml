@@ -119,7 +119,8 @@ loss:
 stream_embedding: false
 # Router input: raw (flattened R0 latent + T5/proprio) | embed (video expert's patch/text embeddings, detached).
 router_input: raw
-# Router architecture on the embed inputs: mlp (EmbedModalityRouter) | transformer (TransformerModalityRouter).
+# Router architecture on the embed inputs: mlp (EmbedModalityRouter) | transformer (TransformerModalityRouter,
+# CLS token) | transformer_query (QueryModalityRouter, one learned query per modality).
 router_arch: mlp
 # Embed router also reads the RGB observation history (needs data.train.image_history_frames > 0).
 router_history: false

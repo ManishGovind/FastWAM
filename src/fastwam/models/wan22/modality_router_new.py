@@ -183,8 +183,9 @@ class EmbedModalityRouter(nn.Module):
 class TransformerModalityRouter(nn.Module):
     """Small transformer over the same inputs as ``EmbedModalityRouter`` (shared + detached by the caller).
 
-    Tokens ``[CLS | r0 patches | text | proprio]``, each ``dim -> d`` + a type embedding (+ a learned
-    position embedding on the r0 patches), ``layers`` pre-norm encoder layers, MLP head on CLS.
+    Tokens ``[CLS | r0 patches | text | proprio]``, each ``dim -> d`` by its own projection (whose bias
+    already tags the source) + a learned position embedding on the r0 patches, ``layers`` pre-norm
+    encoder layers, MLP head on CLS.
     The last head layer is zero-init, so training starts from uniform picks.
     """
 
@@ -197,7 +198,6 @@ class TransformerModalityRouter(nn.Module):
         self.r0_proj, self.text_proj, self.proprio_proj = proj(), proj(), proj()
         self.cls = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         self.r0_pos = nn.Parameter(torch.randn(1, int(num_r0_tokens), d) * 0.02)
-        self.type_emb = nn.Parameter(torch.randn(4, d) * 0.02)  # cls / r0 / text / proprio
         layer = nn.TransformerEncoderLayer(d, heads, 2 * d, dropout=0.0, activation="gelu",
                                            batch_first=True, norm_first=True)
         self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
@@ -207,16 +207,50 @@ class TransformerModalityRouter(nn.Module):
         nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, feats: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        # print("TransformerModalityRouter forward")
         dtype = self.cls.dtype
-        r0 = self.r0_proj(feats["r0"].to(dtype)) + self.r0_pos + self.type_emb[1]          # [B, N, d]
-        text = self.text_proj(feats["text"].to(dtype)) + self.type_emb[2]                  # [B, L, d]
-        proprio = self.proprio_proj(feats["proprio"].to(dtype)).unsqueeze(1) + self.type_emb[3]
-        b, n = r0.shape[:2]
-        x = torch.cat([(self.cls + self.type_emb[0]).expand(b, -1, -1), r0, text, proprio], dim=1)
-        pad = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
-        pad[:, 1 + n:-1] = ~feats["text_mask"].bool()                                     # text pad tokens
-        x = self.encoder(x, src_key_padding_mask=pad)
+        r0 = self.r0_proj(feats["r0"].to(dtype)) + self.r0_pos                            # [B, N, d]
+        text = self.text_proj(feats["text"].to(dtype))                                    # [B, L, d]
+        proprio = self.proprio_proj(feats["proprio"].to(dtype)).unsqueeze(1)
+        x = torch.cat([self.cls.expand(r0.shape[0], -1, -1), r0, text, proprio], dim=1)
+        x = self.encoder(x)   # all tokens attended, incl. the zeroed T5 padding (as the video expert)
         return self.head(x[:, 0]).float()
+
+
+class QueryModalityRouter(nn.Module):
+    """One learned query per modality cross-attends to the ``TransformerModalityRouter`` inputs.
+
+    Memory ``[r0 patches | text | proprio]`` (each ``dim -> d`` by its own projection, position
+    embedding on r0); queries ``[B, K, d]`` -> ``layers`` pre-norm decoder layers (query self-attn,
+    cross-attn to memory, FFN) -> shared ``Linear(d, 1)`` per query = that modality's logit.
+    The head is zero-init, so training starts from uniform picks.
+    """
+
+    def __init__(self, *, dim: int, num_classes: int, num_r0_tokens: int, d: int = 256, heads: int = 4,
+                 layers: int = 2):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_classes = int(num_classes)
+        proj = lambda: nn.Sequential(nn.LayerNorm(self.dim), nn.Linear(self.dim, d))
+        self.r0_proj, self.text_proj, self.proprio_proj = proj(), proj(), proj()
+        self.queries = nn.Parameter(torch.randn(1, self.num_classes, d) * 0.02)
+        self.r0_pos = nn.Parameter(torch.randn(1, int(num_r0_tokens), d) * 0.02)
+        layer = nn.TransformerDecoderLayer(d, heads, 2 * d, dropout=0.0, activation="gelu",
+                                           batch_first=True, norm_first=True)
+        self.decoder = nn.TransformerDecoder(layer, layers)
+        self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 1))
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, feats: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        # print("QueryModalityRouter forward")
+        dtype = self.queries.dtype
+        r0 = self.r0_proj(feats["r0"].to(dtype)) + self.r0_pos                            # [B, N, d]
+        text = self.text_proj(feats["text"].to(dtype))                                    # [B, L, d]
+        proprio = self.proprio_proj(feats["proprio"].to(dtype)).unsqueeze(1)
+        memory = torch.cat([r0, text, proprio], dim=1)   # all tokens attended, incl. the zeroed T5 padding
+        q = self.decoder(self.queries.expand(r0.shape[0], -1, -1), memory)
+        return self.head(q).squeeze(-1).float()                                            # [B, K]
 
 
 def collapse_kl(logits: torch.Tensor) -> torch.Tensor:
