@@ -629,7 +629,7 @@ def main():
     parser.add_argument("--hdf5", type=Path,
                         help="initial reference recording (rollout or teleop HDF5); "
                              "otherwise choose one in the browser")
-    parser.add_argument("--root", type=Path, default=ROOT / "xarm_logs" / "runs",
+    parser.add_argument("--root", type=Path, default=ROOT / "data" / "rollouts" / "runs",
                         help="recordings listed in the Model/File dropdowns")
     parser.add_argument("--camera", choices=sorted(CAMERAS), default="exo",
                         help="exo=overhead (/dev/video18), wrist=gripper (/dev/video4)")

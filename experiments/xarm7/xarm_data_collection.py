@@ -48,15 +48,19 @@ from xarm.core.config import x_code
 from xarm.wrapper import XArmAPI
 
 
-# Cameras (both capture 640x480; crop format: [width, height, x_offset, y_offset]):
+# Cameras (primary and wrist capture 640x480; crop format: [width, height, x_offset, y_offset]):
 #   primary = overhead exo view, /dev/video18
+#   ego     = third camera, angled view of the table, /dev/video10 (1280x720).
+#             Optional extra: recorded as obs/ego_rgb_jpeg, not used by inference.
 #   wrist   = gripper-mounted view, /dev/video4. Mounting orientation depends on
 #             the gripper installed (xhand vs. traditional), so re-check the
 #             crop and keep the same gripper/orientation for collection and eval.
 WRISTCAM_CROP = [480, 480, 80, 0]
-EXO1_CROP = [258, 258, 194, 104]
+EXO1_CROP = [248, 258, 194, 104]
+EGO_CROP = [696, 696, 323, 0]  # square crop from the archived open-teach ROI for this camera
 CROP_TARGET_SIZE = (480, 480)
 CAPTURE_FRAME_SIZE = (640, 480)
+EGO_CAPTURE_FRAME_SIZE = (1280, 720)
 
 TCP_OFFSET = [0, 0, 0, 0, 0, 0]
 HOME_POSE_MM_DEG = (300.0, 0.0, 300.0, 180.0, 0.0, 0.0)
@@ -81,17 +85,18 @@ BUTTON_OPTIONS = 9
 @dataclass
 class CollectionConfig:
     task_name: str = "stack the blue cube on the green cube"
-    save_root: str = "/home/skapse/workspace/cosmos-xarm/xarm_collected_demos"
+    save_root: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     resume_path: str | None = None
     robot_ip: str = "192.168.1.198"
     primary_cam_id: int = 18
     wrist_cam_id: int = 4
+    third_cam_id: int = 10  # ego camera; -1 disables it
     warmup_frames: int = 100
     control_hz: float = 15.0
     max_linear_speed_mm_s: float = 50.0
     max_rotation_speed_deg_s: float = 5.0
     joystick_dead_zone: float = 0.05
-    home_speed_mm_s: float = 200.0
+    home_speed_mm_s: float = 150.0
     home_accel_mm_s2: float = 1000.0
     gripper_speed: int = 5000
     reduced_mode: bool = False
@@ -283,34 +288,56 @@ def crop_and_resize(frame: np.ndarray, crop: list[int]) -> np.ndarray:
     return cv2.resize(cropped, CROP_TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
 
 
-def init_cameras(primary_id: int, wrist_id: int):
+def init_cameras(primary_id: int, wrist_id: int, third_id: int = -1):
     primary_cap = cv2.VideoCapture(primary_id, cv2.CAP_V4L2)
     wrist_cap = cv2.VideoCapture(wrist_id, cv2.CAP_V4L2)
     for cap in (primary_cap, wrist_cap):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_FRAME_SIZE[0])
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_FRAME_SIZE[1])
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return primary_cap, wrist_cap
+    third_cap = None
+    if third_id >= 0:
+        third_cap = cv2.VideoCapture(third_id, cv2.CAP_V4L2)
+        if third_cap.isOpened():
+            third_cap.set(cv2.CAP_PROP_FRAME_WIDTH, EGO_CAPTURE_FRAME_SIZE[0])
+            third_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, EGO_CAPTURE_FRAME_SIZE[1])
+            third_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        else:
+            # The third camera is an optional extra: collect without it.
+            print(f"[camera] warning: could not open third camera /dev/video{third_id}; "
+                  "recording without ego images")
+            third_cap.release()
+            third_cap = None
+    return primary_cap, wrist_cap, third_cap
 
 
-def warmup_cameras(primary_cap, wrist_cap, num_frames: int) -> None:
+def warmup_cameras(primary_cap, wrist_cap, num_frames: int, third_cap=None) -> None:
     for _ in range(num_frames):
         primary_cap.read()
         wrist_cap.read()
+        if third_cap is not None:
+            third_cap.read()
 
 
-def read_observation_images(primary_cap, wrist_cap) -> tuple[np.ndarray, np.ndarray]:
+def read_observation_images(primary_cap, wrist_cap, third_cap=None):
+    """Returns (primary, wrist, ego); ego is None when there is no third camera."""
     ret_primary, primary = primary_cap.read()
     ret_wrist, wrist = wrist_cap.read()
-    if not ret_primary or not ret_wrist:
+    ret_third, third = third_cap.read() if third_cap is not None else (True, None)
+    if not ret_primary or not ret_wrist or not ret_third:
         raise RuntimeError("Camera read failed")
     primary = crop_and_resize(primary, EXO1_CROP)
     wrist = crop_and_resize(wrist, WRISTCAM_CROP)
     primary = cv2.cvtColor(primary, cv2.COLOR_BGR2RGB)
     wrist = cv2.cvtColor(wrist, cv2.COLOR_BGR2RGB)
+    ego = None
+    if third is not None:
+        ego = cv2.cvtColor(crop_and_resize(third, EGO_CROP), cv2.COLOR_BGR2RGB)
+        ego = np.asarray(ego, dtype=np.uint8)
     return (
         np.asarray(primary, dtype=np.uint8),
         np.asarray(wrist, dtype=np.uint8),
+        ego,
     )
 
 
@@ -544,6 +571,7 @@ class TrajectoryRecorder:
     def _reset_buffers(self) -> None:
         self.primary_images: list[np.ndarray] = []
         self.wrist_images: list[np.ndarray] = []
+        self.ego_images: list[np.ndarray] = []
         self.joint_states: list[np.ndarray] = []
         self.ee_states: list[np.ndarray] = []
         self.gripper_states: list[float] = []
@@ -561,6 +589,7 @@ class TrajectoryRecorder:
         self,
         primary_image: np.ndarray,
         wrist_image: np.ndarray,
+        ego_image: np.ndarray | None,
         joint_state: np.ndarray,
         ee_state: np.ndarray,
         gripper_state: float,
@@ -570,6 +599,8 @@ class TrajectoryRecorder:
             return
         self.primary_images.append(primary_image.copy())
         self.wrist_images.append(wrist_image.copy())
+        if ego_image is not None:
+            self.ego_images.append(ego_image.copy())
         self.joint_states.append(joint_state.astype(np.float32).copy())
         self.ee_states.append(ee_state.astype(np.float32).copy())
         self.gripper_states.append(float(gripper_state))
@@ -600,7 +631,11 @@ class TrajectoryRecorder:
     def _write_jpeg_image_dataset(self, root: h5py.Group, key: str, frames: list[np.ndarray]) -> None:
         jpeg_list = [jpeg_encode_image(frame, quality=self.cfg.jpeg_quality) for frame in frames]
         dt = h5py.vlen_dtype(np.dtype("uint8"))
-        root.create_dataset(key, data=jpeg_list, dtype=dt)
+        # Build the object array explicitly: a plain list of equal-length
+        # buffers is collapsed to 2-D by numpy and rejected by the vlen converter.
+        jpeg_arr = np.empty(len(jpeg_list), dtype=object)
+        jpeg_arr[:] = jpeg_list
+        root.create_dataset(key, data=jpeg_arr, dtype=dt)
 
     def stop_and_save(self) -> str | None:
         if not self.recording:
@@ -635,6 +670,8 @@ class TrajectoryRecorder:
 
             self._write_jpeg_image_dataset(obs_grp, "agentview_rgb_jpeg", self.primary_images)
             self._write_jpeg_image_dataset(obs_grp, "eye_in_hand_rgb_jpeg", self.wrist_images)
+            if self.ego_images:
+                self._write_jpeg_image_dataset(obs_grp, "ego_rgb_jpeg", self.ego_images)
             obs_grp.create_dataset("ee_states", data=ee_states, dtype=np.float32)
             obs_grp.create_dataset("ee_pos", data=ee_states[:, :3], dtype=np.float32)
             obs_grp.create_dataset("ee_ori", data=ee_states[:, 3:], dtype=np.float32)
@@ -661,6 +698,9 @@ class TrajectoryRecorder:
             root.attrs["wrist_camera_id"] = int(self.cfg.wrist_cam_id)
             root.attrs["primary_crop"] = np.asarray(EXO1_CROP, dtype=np.int32)
             root.attrs["wrist_crop"] = np.asarray(WRISTCAM_CROP, dtype=np.int32)
+            root.attrs["ego_camera_id"] = int(self.cfg.third_cam_id)
+            root.attrs["ego_crop"] = np.asarray(EGO_CROP, dtype=np.int32)
+            root.attrs["ego_capture_frame_size"] = np.asarray(EGO_CAPTURE_FRAME_SIZE, dtype=np.int32)
             root.attrs["crop_target_size"] = np.asarray(CROP_TARGET_SIZE, dtype=np.int32)
             root.attrs["capture_frame_size"] = np.asarray(CAPTURE_FRAME_SIZE, dtype=np.int32)
             root.attrs["tcp_offset"] = np.asarray(TCP_OFFSET, dtype=np.float32)
@@ -807,6 +847,8 @@ def parse_args() -> CollectionConfig:
     parser.add_argument("--robot-ip", type=str, default=CollectionConfig.robot_ip)
     parser.add_argument("--primary-cam-id", type=int, default=CollectionConfig.primary_cam_id)
     parser.add_argument("--wrist-cam-id", type=int, default=CollectionConfig.wrist_cam_id)
+    parser.add_argument("--third-cam-id", type=int, default=CollectionConfig.third_cam_id,
+                        help="ego camera /dev/video index; -1 disables it")
     parser.add_argument("--warmup-frames", type=int, default=CollectionConfig.warmup_frames)
     parser.add_argument("--control-hz", type=float, default=CollectionConfig.control_hz)
     parser.add_argument("--max-linear-speed-mm-s", type=float, default=CollectionConfig.max_linear_speed_mm_s)
@@ -842,6 +884,7 @@ def parse_args() -> CollectionConfig:
         robot_ip=args.robot_ip,
         primary_cam_id=args.primary_cam_id,
         wrist_cam_id=args.wrist_cam_id,
+        third_cam_id=args.third_cam_id,
         warmup_frames=args.warmup_frames,
         control_hz=args.control_hz,
         max_linear_speed_mm_s=args.max_linear_speed_mm_s,
@@ -861,6 +904,7 @@ def main() -> None:
     arm: XArmAPI | None = None
     primary_cap = None
     wrist_cap = None
+    third_cap = None
 
     recorder = TrajectoryRecorder(cfg)
     last_observed_pos = list(HOME_POSE_MM_DEG[:3])
@@ -881,8 +925,9 @@ def main() -> None:
     try:
         controller = PS5Controller(cfg)
         arm, _, _, gripper_target = init_arm(cfg)
-        primary_cap, wrist_cap = init_cameras(cfg.primary_cam_id, cfg.wrist_cam_id)
-        warmup_cameras(primary_cap, wrist_cap, cfg.warmup_frames)
+        primary_cap, wrist_cap, third_cap = init_cameras(
+            cfg.primary_cam_id, cfg.wrist_cam_id, cfg.third_cam_id)
+        warmup_cameras(primary_cap, wrist_cap, cfg.warmup_frames, third_cap)
         last_gripper_raw = float(gripper_target)
 
         period_s = 1.0 / cfg.control_hz
@@ -942,8 +987,10 @@ def main() -> None:
 
                 primary_rgb = None
                 wrist_rgb = None
+                ego_rgb = None
                 try:
-                    primary_rgb, wrist_rgb = read_observation_images(primary_cap, wrist_cap)
+                    primary_rgb, wrist_rgb, ego_rgb = read_observation_images(
+                        primary_cap, wrist_cap, third_cap)
                 except Exception as exc:
                     print(f"[camera] warning: {exc}")
 
@@ -958,6 +1005,7 @@ def main() -> None:
                     recorder.append_step(
                         primary_image=pending_step["primary_image"],
                         wrist_image=pending_step["wrist_image"],
+                        ego_image=pending_step["ego_image"],
                         joint_state=pending_step["joint_state"],
                         ee_state=pending_step["ee_state"],
                         gripper_state=float(pending_step["gripper_state"]),
@@ -977,6 +1025,7 @@ def main() -> None:
                     pending_step = {
                         "primary_image": primary_rgb.copy(),
                         "wrist_image": wrist_rgb.copy(),
+                        "ego_image": None if ego_rgb is None else ego_rgb.copy(),
                         "joint_state": last_joint_state.astype(np.float32).copy(),
                         "ee_state": ee_state,
                         "gripper_state": gripper_raw_to_dataset_state(last_gripper_raw),
@@ -1016,6 +1065,8 @@ def main() -> None:
             primary_cap.release()
         if wrist_cap is not None:
             wrist_cap.release()
+        if third_cap is not None:
+            third_cap.release()
         if arm is not None:
             stop_robot(arm)
             arm.disconnect()

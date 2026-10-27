@@ -67,8 +67,9 @@ def jpeg_encode_image(image, quality=95):
 
 
 def save_rollout_video(images, idx, success, task_description, log_file=None, fps=24,
-                       out_dir="./xarm_logs"):
+                       out_dir=None):
     """Write an MP4 of an episode; the caller moves it into the test dir."""
+    out_dir = out_dir or ROLLOUTS_DIR
     os.makedirs(out_dir, exist_ok=True)
     task_tag = task_description.lower().replace(" ", "_")[:50]
     mp4_path = os.path.join(
@@ -86,7 +87,7 @@ def save_rollout_video(images, idx, success, task_description, log_file=None, fp
 # Exact collection-time crop settings (from xarm.py)
 # crop format: [width, height, x_offset, y_offset]
 WRISTCAM_CROP = [480, 480, 80, 0]
-EXO1_CROP = [258, 258, 194, 104]
+EXO1_CROP = [248, 258, 194, 104]
 CROP_TARGET_SIZE = (480, 480)
 CAPTURE_FRAME_SIZE = (640, 480)
 WARMUP_FRAMES = 60
@@ -207,7 +208,12 @@ TASKS = {
 
 TCP_OFFSET = [0, 0, 0, 0, 0, 0]
 
-OBSERVATIONS_DIR = "/home/skapse/workspace/cosmos-xarm/cosmos-deploy/observations"
+# All rollout outputs live under data/rollouts/ next to this script:
+#   runs/          per-run, per-trial videos and episode HDF5s
+#   observations/  per-query model-input PNGs
+#   *.txt          run logs
+ROLLOUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "rollouts")
+OBSERVATIONS_DIR = os.path.join(ROLLOUTS_DIR, "observations")
 
 
 def next_test_dir():
@@ -257,7 +263,7 @@ class PolicyEvalConfig:
     seed: int = 20
     data_collection: bool = True
     jpeg_compress: bool = True
-    local_log_dir: str = "./xarm_logs"
+    local_log_dir: str = ROLLOUTS_DIR
     run_id_note: str = "xarm"
 
     ar_future_prediction: bool = False
@@ -690,7 +696,7 @@ def _safe_run_name(name):
 
 
 def next_run_dir(runs_root, name_hint=None):
-    """Create xarm_logs/runs/<model_tag>/, suffixing repeat names as needed."""
+    """Create data/rollouts/runs/<model_tag>/, suffixing repeat names as needed."""
     os.makedirs(runs_root, exist_ok=True)
     if name_hint:
         base = _safe_run_name(name_hint)

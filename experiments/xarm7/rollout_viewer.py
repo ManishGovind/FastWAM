@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Browse, play back, and score recorded xArm7 rollouts and demonstrations.
 
-Lists every *.hdf5 under --root (default xarm_logs/runs, where
+Lists every *.hdf5 under --root (default data/rollouts/runs, where
 xarm_fastwam_inference.py saves its episodes), shows each demo's metadata,
 plays the exo and wrist cameras (buffered in the browser and drawn every
 display frame), and edits the 0/50/100 trial score of inference episodes.
@@ -16,7 +16,7 @@ Two file layouts are read:
 Reads never take an HDF5 file lock. Score edits take the normal write lock.
 
 Usage (fastwam_xarm7 env):
-  python rollout_viewer.py [--root xarm_logs/runs] [--http-port 8766]
+  python rollout_viewer.py [--root data/rollouts/runs] [--http-port 8766]
 then open http://<this-host>:8766
 """
 
@@ -39,6 +39,7 @@ SCORE_LEVELS = {0: "no contact", 50: "touched", 100: "goal reached"}
 CAMERAS = {
     "exo": ("obs/agentview_rgb_jpeg", "primary_images_jpeg"),
     "wrist": ("obs/eye_in_hand_rgb_jpeg", "wrist_images_jpeg"),
+    "ego": ("obs/ego_rgb_jpeg",),  # optional third camera in collected demos
 }
 DEFAULT_HZ = 5.0  # inference control rate; collected demos store control_hz
 MAX_BATCH_FRAMES = 120
@@ -334,7 +335,7 @@ figcaption{position:absolute;left:8px;top:6px;font-size:12px;background:#000a;pa
 <script>
 const $=id=>document.getElementById(id), enc=encodeURIComponent;
 const LEVELS={'-1':'unscored',0:'0 · no contact',50:'50 · touched',100:'100 · goal reached'};
-const NAMES={exo:'exo',wrist:'wrist'};
+const NAMES={exo:'exo',wrist:'wrist',ego:'ego'};
 const CHUNK=60, AHEAD_S=3, KEEP=300;   // frames per request, read-ahead, frames kept around the playhead
 const S={files:[],filesKey:'',model:'',file:'',detail:null,demo:'',times:[],cams:[],ctx:{},frame:0,drawn:-1,
  playing:false,speed:1,clock:0,last:0,buffering:false,token:0,bitmaps:new Map(),pending:new Set(),ticks:[]};
@@ -593,7 +594,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", type=Path, default=ROOT / "xarm_logs" / "runs",
+    parser.add_argument("--root", type=Path, default=ROOT / "data" / "rollouts" / "runs",
                         help="directory searched recursively for *.hdf5 recordings")
     parser.add_argument("--http-host", default="0.0.0.0")
     parser.add_argument("--http-port", type=int, default=8766)
