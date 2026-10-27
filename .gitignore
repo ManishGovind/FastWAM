@@ -285,3 +285,6 @@ MUJOCO_LOG.TXT
 !notebooks/router_analysis/outputs/
 notebooks/router_analysis/outputs/*
 !notebooks/router_analysis/outputs/full_all_attention_mask.html
+
+# xArm7 collected demos and rollouts
+/experiments/xarm7/data/
