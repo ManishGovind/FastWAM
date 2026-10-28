@@ -222,6 +222,7 @@ class FastWAMJointMultimodalSelectGumbel(FastWAMJointMultimodalSelectNew):
         # --- end of shared part ---
 
         # Router over detached R0 + MoT context (same inputs as the REINFORCE router).
+        self._router_history_latent = self._encode_router_history(sample.get("video_rgb_history"))
         feats = self._build_router_features(
             r0_latent=stream_latents["rgb"][:, :, 0], context=context, context_mask=context_mask
         )

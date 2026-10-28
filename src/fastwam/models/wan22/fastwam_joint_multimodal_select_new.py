@@ -77,7 +77,7 @@ logger = get_logger(__name__)
 
 MODALITY_SELECT_MODES = ("all", "random", "router", "gt")
 _ROUTER_FEATURE_GROUPS = ("r0", "context")
-ROUTER_REWARDS = ("action", "task")
+ROUTER_REWARDS = ("action", "task", "counterfactual")
 ROUTER_BASELINES = ("batch", "timestep_ema")
 ROUTER_LAYOUTS = ("short", "full")
 ROUTER_VIDEO_LOSSES = ("chosen", "all")
@@ -198,9 +198,15 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # _build_multistream_mot_attention_mask / _action_stream_gate.
         model._action_stream_log_gate = None
         model.modality_prompt = modality_prompt
+        if router_reward == "counterfactual" and (
+            model.modality_select != "router" or router_layout != "full" or router_video_loss != "all" or modality_prompt
+        ):
+            raise ValueError("`router_reward: counterfactual` needs modality_select=router, router_layout=full, "
+                             "router_video_loss=all and modality_prompt=false (every future is in the sequence).")
         model.modality_prompt_mode = modality_prompt_mode
         model.modality_prompt_target = modality_prompt_target
-        # Learned per-stream identity on the adaLN timestep embedding (see _joint_denoise_multistream).
+        # Learned per-stream identity (see _joint_denoise_multistream). Where it is added
+        # (model.stream_embedding_mode: timestep | token) is popped + validated by the parent.
         # On video_expert -> inside model.mot -> trained + checkpointed. Small random init (0.02).
         model.use_stream_embedding = stream_embedding
         if stream_embedding:
@@ -840,6 +846,28 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         return enabled, names, sizes
 
     @torch.no_grad()
+    def _build_counterfactual_mot_attention_mask(
+        self,
+        stream_seq_lens: list[int],
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        device: torch.device,
+        enabled_streams: Optional[Sequence[str]] = None,
+    ) -> torch.Tensor:
+        """Bool ``[S, S]`` for ``R0 | futures | A_<m> for every stream m`` (``router_reward: counterfactual``).
+
+        Video rows as in the base mask (R0 + own future). Action copy ``A_m`` attends R0, ``X_f^m`` and
+        itself only, i.e. exactly what the single gated action block attends when stream ``m`` is chosen.
+        """
+        enabled, names, sizes = self._mot_blocks(stream_seq_lens, action_seq_len, video_tokens_per_frame, enabled_streams)
+        names = names[:-1] + [f"A_{n}" for n in enabled]
+        sizes = sizes[:-1] + [int(action_seq_len)] * len(enabled)
+        allow = {"R0": {"R0"}, **{n: {"R0", n} for n in enabled}, **{f"A_{n}": {"R0", n, f"A_{n}"} for n in enabled}}
+        block = torch.tensor([[col in allow[row] for col in names] for row in names], dtype=torch.bool)
+        reps = torch.tensor(sizes)
+        return block.repeat_interleave(reps, 0).repeat_interleave(reps, 1).to(device)
+
+    @torch.no_grad()
     def _build_multistream_mot_attention_mask_base(
         self,
         stream_seq_lens: list[int],
@@ -1044,8 +1072,13 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         active_future: Optional[str] = None,
         action_context: Optional[torch.Tensor] = None,
         action_context_mask: Optional[torch.Tensor] = None,
+        action_copies: int = 1,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Joint denoise over multistream MoT.
+
+        ``action_copies=K`` (counterfactual router reward, training only): the action tokens are
+        repeated K times (same noisy input, timestep and RoPE positions); copy m reads only R0 + the
+        future of stream m. ``pred_action`` is then ``[B, K*H, D]`` (copy m = rows m*H:(m+1)*H).
 
         ``action_context``: text context for the action expert's cross-attention
         (default: the same ``context`` as the video expert).
@@ -1110,12 +1143,16 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
             )
             if getattr(self, "use_stream_embedding", False):
-                # Stream identity (DiT class-conditioning style): add a learned per-stream vector
-                # to the timestep embedding of this stream's FUTURE tokens (R0 / frame 0 untouched),
-                # then rebuild the adaLN modulation. Keyed by stream name -> short == full layout.
-                s_emb = self.video_expert.stream_embedding[_STREAM_KEYS.index(name)].to(t_video.dtype)
-                t_video = torch.cat([t_video[:, :tokens_per_frame], t_video[:, tokens_per_frame:] + s_emb], dim=1)
-                t_mod_video = self.video_expert.time_projection(t_video).unflatten(2, (6, self.video_expert.hidden_dim))
+                # Stream identity on the future tokens only (R0 / frame 0 untouched), keyed by stream name.
+                s_emb = self.video_expert.stream_embedding[_STREAM_KEYS.index(name)]
+                tpf = tokens_per_frame
+                if getattr(self, "stream_embedding_mode", "timestep") == "token":
+                    # added once to the patch-embedded noisy future tokens; adaLN / head see only the noise level
+                    video_tokens = torch.cat([video_tokens[:, :tpf], video_tokens[:, tpf:] + s_emb.to(video_tokens.dtype)], dim=1)
+                else:
+                    # added to the timestep embedding, then the adaLN modulation is rebuilt
+                    t_video = torch.cat([t_video[:, :tpf], t_video[:, tpf:] + s_emb.to(t_video.dtype)], dim=1)
+                    t_mod_video = self.video_expert.time_projection(t_video).unflatten(2, (6, self.video_expert.hidden_dim))
             prepared[name] = {
                 "tokens": video_tokens,
                 "t": t_video,
@@ -1215,14 +1252,29 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         )
 
         stream_seq_lens = [int(mot_parts[n]["tokens"].shape[1]) for n in mot_streams]
-        attention_mask = self._build_multistream_mot_attention_mask(
-            stream_seq_lens=stream_seq_lens,
-            action_seq_len=action_tokens.shape[1],
-            video_tokens_per_frame=tpf,
-            device=video_tokens.device,
-            action_attend_mode=attend_mode,
-            enabled_streams=mot_streams,
-        )
+        if action_copies > 1:
+            if active_future is not None or len(mot_streams) != int(action_copies):
+                raise ValueError("`action_copies` needs every enabled future in the MoT (active_future=None).")
+            action_len = int(action_tokens.shape[1])
+            attention_mask = self._build_counterfactual_mot_attention_mask(
+                stream_seq_lens=stream_seq_lens,
+                action_seq_len=action_len,
+                video_tokens_per_frame=tpf,
+                device=video_tokens.device,
+                enabled_streams=mot_streams,
+            )
+            action_tokens = action_tokens.repeat(1, action_copies, 1)
+            freqs_action = freqs_action.repeat(action_copies, 1, 1)
+            context_mask_action = context_mask_action.repeat(1, action_copies, 1)
+        else:
+            attention_mask = self._build_multistream_mot_attention_mask(
+                stream_seq_lens=stream_seq_lens,
+                action_seq_len=action_tokens.shape[1],
+                video_tokens_per_frame=tpf,
+                device=video_tokens.device,
+                action_attend_mode=attend_mode,
+                enabled_streams=mot_streams,
+            )
 
         video_tokens_out, action_tokens_out = self.mot.forward_joint_core(
             video_tokens=video_tokens,
@@ -1378,6 +1430,16 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         action_loss_per_sample = torch.zeros(
             batch_size, device=stream_latents["rgb"].device, dtype=torch.float32
         )
+        # Counterfactual router reward: every sample is denoised once with one action copy per stream;
+        # action_loss_per_copy[:, m] = action loss when the action reads stream m.
+        counterfactual = (
+            getattr(self, "router_reward", "action") == "counterfactual"
+            and modality_choices is not None and router_logits is not None
+        )
+        action_loss_per_copy = (
+            torch.zeros(batch_size, len(enabled), device=stream_latents["rgb"].device, dtype=torch.float32)
+            if counterfactual else None
+        )
         # Detached accumulators for per-stream logging (sum of weighted sample losses).
         stream_loss_acc = {name: 0.0 for name in enabled}
         stream_loss_count = {name: 0 for name in enabled}
@@ -1405,6 +1467,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             noisy_sub = {k: noisy_latents[k].index_select(0, idx) for k in needed}
             action_cond = action.index_select(0, idx) if action is not None else None
             sub_choices = None if full_choices is None else full_choices.index_select(0, idx)
+            if counterfactual:
+                sub_choices = None   # no gate: one action copy per stream (mask in _joint_denoise_multistream)
             gate = (
                 contextlib.nullcontext()
                 if sub_choices is None
@@ -1423,6 +1487,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                     active_future=None if sub_choices is not None else active_future,
                     action_context=None if act_ctx is None else act_ctx.index_select(0, idx),
                     action_context_mask=self._slice_batch(act_ctx_mask, idx),
+                    action_copies=len(enabled) if counterfactual else 1,
                 )
 
             video_names = (
@@ -1456,19 +1521,22 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 stream_loss_count[name] += n_used
 
             tgt_a = target_action.index_select(0, idx)
-            action_loss_token = F.mse_loss(
-                pred_action.float(), tgt_a.float(), reduction="none"
-            ).mean(dim=2)
             action_pad_sub = self._slice_batch(action_is_pad, idx)
-            if action_pad_sub is not None:
-                valid = (~action_pad_sub).to(
-                    device=action_loss_token.device, dtype=action_loss_token.dtype
-                )
-                valid_sum = valid.sum(dim=1).clamp(min=1.0)
-                a_ps = (action_loss_token * valid).sum(dim=1) / valid_sum
+
+            def _action_loss_ps(pred: torch.Tensor) -> torch.Tensor:
+                action_loss_token = F.mse_loss(pred.float(), tgt_a.float(), reduction="none").mean(dim=2)
+                if action_pad_sub is not None:
+                    valid = (~action_pad_sub).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+                    return (action_loss_token * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+                return action_loss_token.mean(dim=1)
+
+            if counterfactual:
+                h = tgt_a.shape[1]
+                per_copy = torch.stack([_action_loss_ps(pred_action[:, m * h:(m + 1) * h]) for m in range(len(enabled))], 1)
+                action_loss_per_copy[idx] = per_copy.float()
+                action_loss_per_sample[idx] = per_copy.float().mean(dim=1)   # every copy trains the action expert
             else:
-                a_ps = action_loss_token.mean(dim=1)
-            action_loss_per_sample[idx] = a_ps.float()
+                action_loss_per_sample[idx] = _action_loss_ps(pred_action).float()
 
         if modality_choices is None:
             all_idx = torch.arange(batch_size, device=stream_latents["rgb"].device)
@@ -1505,9 +1573,45 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
 
         loss_total = loss_video_total + loss_action_weighted
 
+        # Learned router, counterfactual reward: expected relative action loss under the policy.
+        if counterfactual:
+            # Per sample and stream: the action loss when the action reads that stream (same weights as loss_total).
+            cf = (self.loss_lambda_action * action_loss_per_copy * action_weight.float()[:, None]).detach()   # [B, K]
+            advantage = cf - cf.mean(dim=1, keepdim=True)            # relative to the other streams, same sample
+            if self.router_adv_normalize and advantage.numel() > 1:
+                advantage = advantage / advantage.std().clamp_min(1e-6)
+            probs_ps = router_log_probs.exp()
+            cf_loss = (probs_ps * advantage).sum(dim=-1).mean()       # gradient: each stream by its own loss
+            entropy = -(probs_ps * router_log_probs).sum(dim=-1).mean()
+            collapse = collapse_kl(router_logits)
+            router_loss = (
+                cf_loss
+                - float(self.router_entropy_coef) * entropy
+                + float(self.router_collapse_kl) * collapse
+            )
+            in_warmup = self._router_in_warmup()
+            if self._router_is_training():
+                loss_total = loss_total + (0.0 if in_warmup else 1.0) * router_loss
+            loss_dict["router_warmup"] = float(in_warmup)
+            loss_dict["loss_router"] = float(router_loss.detach().item())
+            loss_dict["router_cf"] = float(cf_loss.detach().item())
+            loss_dict["router_reward"] = float(cf.mean().item())
+            loss_dict["router_entropy"] = float(entropy.detach().item())
+            loss_dict["router_collapse_kl"] = float(collapse.detach().item())
+            probs = probs_ps.detach().mean(0)
+            best = cf.argmin(dim=1)
+            argmax = router_logits.detach().argmax(dim=1)
+            for i, name in enumerate(enabled):
+                loss_dict[f"router_p_{name}"] = float(probs[i].item())
+                loss_dict[f"router_pick_{name}"] = float((argmax == i).float().mean().item())   # what eval would pick
+                loss_dict[f"router_cf_best_{name}"] = float((best == i).float().mean().item())  # lowest action loss
+                loss_dict[f"loss_action_{name}"] = float(cf[:, i].mean().item())
+            self._router_tick()
+
         # Learned router: REINFORCE on a per-sample reward + entropy / collapse KL.
         if (
-            getattr(self, "modality_select", "all") == "router"
+            not counterfactual
+            and getattr(self, "modality_select", "all") == "router"
             and router_logits is not None
             and router_log_probs is not None
             and modality_choices is not None

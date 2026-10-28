@@ -361,6 +361,7 @@ def create_fastwam_joint_multimodal(
     device: str = "cuda",
     cross_stream_attention: str = "none",
     stream_embedding: bool = False,
+    stream_embedding_mode: str = "timestep",
 ):
     """Factory for FastWAMJointMultimodal (RGB+depth+flow train, RGB-only infer)."""
     from .models.wan22.fastwam_joint_multimodal import FastWAMJointMultimodal
@@ -436,6 +437,7 @@ def create_fastwam_joint_multimodal(
         enabled_video_streams=enabled_video_streams,
         cross_stream_attention=str(cross_stream_attention),
         stream_embedding=bool(stream_embedding),
+        stream_embedding_mode=str(stream_embedding_mode),
         stream_router_mode=stream_router_mode,
         stream_router_temperature=float(stream_router_temperature),
     )

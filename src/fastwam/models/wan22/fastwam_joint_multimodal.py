@@ -53,6 +53,11 @@ class FastWAMJointMultimodal(FastWAMJoint):
                 f"`cross_stream_attention` must be none|cascade|full, got {cross_stream_attention!r}"
             )
         stream_embedding = bool(kwargs.pop("stream_embedding", False))
+        # Where the stream vector is added: "timestep" (adaLN of every block + head) | "token" (once, to
+        # the patch-embedded future tokens).
+        stream_embedding_mode = str(kwargs.pop("stream_embedding_mode", "timestep")).lower()
+        if stream_embedding_mode not in ("timestep", "token"):
+            raise ValueError(f"`stream_embedding_mode` must be timestep|token, got {stream_embedding_mode!r}")
         stream_router_mode = str(kwargs.pop("stream_router_mode", "off")).lower()
         stream_router_temperature = float(kwargs.pop("stream_router_temperature", 1.0))
         model = super().from_wan22_pretrained(**kwargs)
@@ -64,6 +69,7 @@ class FastWAMJointMultimodal(FastWAMJoint):
         # Learned per-stream identity on the adaLN timestep embedding of the future tokens
         # (as in the _new model). On video_expert -> inside model.mot -> trained + checkpointed.
         model.use_stream_embedding = stream_embedding
+        model.stream_embedding_mode = stream_embedding_mode
         if stream_embedding:
             model.video_expert.stream_embedding = torch.nn.Parameter(
                 torch.randn(len(_STREAM_KEYS), model.video_expert.hidden_dim,
@@ -75,11 +81,12 @@ class FastWAMJointMultimodal(FastWAMJoint):
         del stream_router_mode, stream_router_temperature
 
         logger.info(
-            "FastWAMJointMultimodal streams=%s cross_stream_attention=%s stream_embedding=%s "
+            "FastWAMJointMultimodal streams=%s cross_stream_attention=%s stream_embedding=%s (%s) "
             "loss lambdas: rgb=%.4f depth=%.4f flow=%.4f action=%.4f",
             list(model.enabled_video_streams),
             model.cross_stream_attention,
             model.use_stream_embedding,
+            model.stream_embedding_mode,
             model.loss_lambda_rgb,
             model.loss_lambda_depth,
             model.loss_lambda_flow,
@@ -381,11 +388,16 @@ class FastWAMJointMultimodal(FastWAMJoint):
                 fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
             )
             if getattr(self, "use_stream_embedding", False):
-                # Stream identity: add the stream's vector to the timestep embedding of its future
-                # tokens (R0 / frame 0 untouched), then rebuild the adaLN modulation.
-                s_emb = self.video_expert.stream_embedding[_STREAM_KEYS.index(name)].to(t_video.dtype)
-                t_video = torch.cat([t_video[:, :tokens_per_frame], t_video[:, tokens_per_frame:] + s_emb], dim=1)
-                t_mod_video = self.video_expert.time_projection(t_video).unflatten(2, (6, self.video_expert.hidden_dim))
+                # Stream identity on the future tokens only (R0 / frame 0 untouched), keyed by stream name.
+                s_emb = self.video_expert.stream_embedding[_STREAM_KEYS.index(name)]
+                tpf = tokens_per_frame
+                if getattr(self, "stream_embedding_mode", "timestep") == "token":
+                    # added once to the patch-embedded noisy future tokens; adaLN / head see only the noise level
+                    video_tokens = torch.cat([video_tokens[:, :tpf], video_tokens[:, tpf:] + s_emb.to(video_tokens.dtype)], dim=1)
+                else:
+                    # added to the timestep embedding, then the adaLN modulation is rebuilt
+                    t_video = torch.cat([t_video[:, :tpf], t_video[:, tpf:] + s_emb.to(t_video.dtype)], dim=1)
+                    t_mod_video = self.video_expert.time_projection(t_video).unflatten(2, (6, self.video_expert.hidden_dim))
             prepared[name] = {
                 "tokens": video_tokens,
                 "t": t_video,
