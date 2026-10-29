@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "target_size": 480,
+  "coordinate_system": "decoded source JPEG pixels; x=column, y=row",
+  "cameras": {
+    "cam0": {
+      "x": 323,
+      "y": 0,
+      "size": 696,
+      "source_width": 1280,
+      "source_height": 720,
+      "camera_serial": "341222300710"
+    },
+    "cam1": {
+      "x": 115,
+      "y": 0,
+      "size": 480,
+      "source_width": 640,
+      "source_height": 480,
+      "camera_serial": "334622071624"
+    },
+    "cam2": {
+      "x": 194,
+      "y": 104,
+      "size": 258,
+      "source_width": 640,
+      "source_height": 480,
+      "camera_serial": "341522301282"
+    }
+  }
+}

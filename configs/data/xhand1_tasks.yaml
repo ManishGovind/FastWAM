@@ -1,0 +1,89 @@
+# xArm7 + XHand1 real-world LeRobot v2.1 dataset (stack cups / flip notebook / clean whiteboard).
+# 30 fps, 3 cams at 480x480 (AV1). Action/state are 18-D and ABSOLUTE:
+#   arm: EE pose [x, y, z (m), rx, ry, rz (rad)], action[t] == state[t+1]
+#   hand: 12 joint targets (rad); action = commanded target, state = measured joints
+train:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+    - /home/wchi/Datasets/xhand_lerobot_v21/stack_cups/train
+    - /home/wchi/Datasets/xhand_lerobot_v21/flip_the_notebook/train
+    - /home/wchi/Datasets/xhand_lerobot_v21/clean_the_whiteboard/train
+  shape_meta:
+    images:
+      # robotwin layout: first key -> top 256x320, next two -> bottom 128x160 each
+      - key: exo # front view over the table, sees the whole workspace
+        raw_shape: [3, 480, 480]
+        shape: [3, 240, 320]
+      - key: ego # side view of the arm
+        raw_shape: [3, 480, 480]
+        shape: [3, 240, 320]
+      - key: wrist
+        raw_shape: [3, 480, 480]
+        shape: [3, 240, 320]
+    action:
+      - key: default
+        raw_shape: 18 # arm EE pose 6 + hand joints 12
+        shape: 18
+    state:
+      - key: default
+        raw_shape: 18
+        shape: 18
+  num_frames: 33
+  global_sample_stride: 3 # 30hz -> 10hz? 1
+  action_video_freq_ratio: 4 # 32 action, 9 video frames
+  video_size: [384, 320] # robotwin 3-cam layout
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  skip_padding_as_possible: false
+  concat_multi_camera: "robotwin"
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 3
+    action_output_dim: 18
+    proprio_output_dim: 18
+    # all dims are absolute: padded steps keep the replicated last action (hold pose),
+    # so none of them may be zeroed as deltas
+    delta_action_dim_mask: null
+
+    action_state_transforms: null
+    use_stepwise_action_norm: False
+    norm_default_mode: "z-score"
+    norm_exception_mode: null
+
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [240, 320]
+  text_embedding_cache_dir: ./data/text_embeds_cache/xhand1_tasks
+  context_len: 128
+
+# Held-out val split from the converter; normalized with the train stats (runs/.../dataset_stats.json).
+val:
+  _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  dataset_dirs:
+    - /home/wchi/Datasets/xhand_lerobot_v21/stack_cups/val
+    - /home/wchi/Datasets/xhand_lerobot_v21/flip_the_notebook/val
+    - /home/wchi/Datasets/xhand_lerobot_v21/clean_the_whiteboard/val
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  global_sample_stride: ${data.train.global_sample_stride}
+  action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+  video_size: ${data.train.video_size}
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: false
+  skip_padding_as_possible: false
+  concat_multi_camera: ${data.train.concat_multi_camera}
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: ${data.train.context_len}
