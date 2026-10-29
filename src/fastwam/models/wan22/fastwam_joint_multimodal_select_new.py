@@ -1576,7 +1576,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # Learned router, counterfactual reward: expected relative action loss under the policy.
         if counterfactual:
             # Per sample and stream: the action loss when the action reads that stream (same weights as loss_total).
-            cf = (self.loss_lambda_action * action_loss_per_copy * action_weight.float()[:, None]).detach()   # [B, K]
+            cf = (self.loss_lambda_action * action_loss_per_copy * action_weight.float().reshape(-1, 1)).detach()   # [B, K]; weight is [B] or scalar (eval)
             advantage = cf - cf.mean(dim=1, keepdim=True)            # relative to the other streams, same sample
             if self.router_adv_normalize and advantage.numel() > 1:
                 advantage = advantage / advantage.std().clamp_min(1e-6)
