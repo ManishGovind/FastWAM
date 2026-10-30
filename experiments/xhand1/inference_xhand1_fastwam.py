@@ -10,7 +10,9 @@ SafeRobotExecutor (workspace / IK / per-step / XHand limits), XHand startup
 reset, HDF5 rollout recording, and terminal scoring. FastWAM therefore runs
 behind the same guards as the VPP robot-client. The loop below is
 deploy_policy._run_hardware_loop with these differences:
-  * all three post-ROI 480x480 cameras (exo, ego, wrist) are model inputs;
+  * the model cameras come from the server's /metadata (the checkpoint's
+    shape_meta, e.g. ego + wrist); exo is subscribed only if the model uses it
+    or for --record-h5;
   * actions are absolute targets by default; with --action-mode relative the
     server's delta dims are per-step increments accumulated from the state;
   * the model horizon (32 steps) is longer than a VPP chunk, so only the first
@@ -38,7 +40,7 @@ import xhand1_hardware as hw
 
 STATE_DIM = ACTION_DIM = 18
 # FastWAM camera key (training shape_meta) -> hardware stream name.
-MODEL_CAMERAS = {"exo": "exo", "ego": "static", "wrist": "wrist"}
+CAMERA_STREAMS = {"exo": "exo", "ego": "static", "wrist": "wrist"}
 
 
 def _read_json(request: Request, timeout_s: float) -> dict[str, object]:
@@ -74,6 +76,7 @@ class FastWAMClient:
         self.timeout_s = timeout_s
         self.action_mode = action_mode
         self.relative_dims = None
+        self.image_keys = None
         self.run_id = None
         self.demo_id = "demo_1"
         self.chunk_id = 0
@@ -94,8 +97,9 @@ class FastWAMClient:
             problems.append(f"relative_dims has {len(relative_dims)} entries, expected {ACTION_DIM}")
         elif len(set(relative_dims[3:6])) != 1:
             problems.append("rotation dims 3:6 must be all relative or all absolute")
-        if set(meta.get("image_keys", [])) != set(MODEL_CAMERAS):
-            problems.append(f"image_keys={meta.get('image_keys')}, expected {sorted(MODEL_CAMERAS)}")
+        image_keys = list(meta.get("image_keys", []))
+        if not image_keys or not set(image_keys) <= set(CAMERA_STREAMS):
+            problems.append(f"image_keys={image_keys}, expected a subset of {sorted(CAMERA_STREAMS)}")
         if int(meta.get("action_horizon", 0)) < execute_steps:
             problems.append(f"action_horizon={meta.get('action_horizon')} < --execute-steps={execute_steps}")
         policy_hz = float(meta.get("policy_hz", 0.0))
@@ -108,6 +112,7 @@ class FastWAMClient:
         self.substeps = int(round(substeps))
         self.action_horizon = int(meta["action_horizon"])
         self.relative_dims = np.asarray(relative_dims, dtype=bool)
+        self.image_keys = image_keys
         return meta
 
     def start_run(self, execute: bool) -> str:
@@ -130,7 +135,7 @@ class FastWAMClient:
         payload = {
             "prompt": self.prompt,
             "state": np.asarray(state, dtype=float).tolist(),
-            "images": {key: base64.b64encode(packets[key]["jpeg"]).decode("ascii") for key in MODEL_CAMERAS},
+            "images": {key: base64.b64encode(packets[key]["jpeg"]).decode("ascii") for key in self.image_keys},
             "run_id": self.run_id,
             "demo_id": self.demo_id,
             "chunk_id": self.chunk_id,
@@ -153,20 +158,21 @@ class FastWAMClient:
         return actions
 
 
-class OpenTeachCameraTriple(hw.OpenTeachCameraPair):
-    """The vendored camera pair with exo promoted from recording-only to a model input."""
+class OpenTeachModelCameras(hw.OpenTeachCameraPair):
+    """The vendored camera pair (+ optional exo) read by FastWAM camera key."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if "exo" not in self.streams:
-            self.close()
-            raise hw.SafetyViolation("FastWAM needs the exo camera; pass exo_port")
-        self.last_read_source_ns["exo"] = None
+        if "exo" in self.streams:
+            self.last_read_source_ns["exo"] = None
 
-    def read_model_packets(self) -> dict[str, dict]:
-        """Fresh post-ROI frames for every model camera, keyed by FastWAM camera key."""
+    def read_model_packets(self, keys: list[str]) -> dict[str, dict]:
+        """Fresh post-ROI frames for the given model cameras, keyed by FastWAM camera key."""
         packets = {}
-        for key, name in MODEL_CAMERAS.items():
+        for key in keys:
+            name = CAMERA_STREAMS[key]
+            if name not in self.streams:
+                raise hw.SafetyViolation(f"model camera {key} ({name}) was not opened")
             packet = self.streams[name].wait_for_new(self.last_read_source_ns[name], self.timeout_ms)
             self._validate_age(name, packet)
             self.last_read_source_ns[name] = packet["host_monotonic_ns"]
@@ -221,20 +227,20 @@ def annotate_recording(recorder, args: argparse.Namespace, client: FastWAMClient
     attrs["action_semantics"] = client.action_mode
     attrs["fastwam_server"] = client.server
     attrs["fastwam_run_id"] = client.run_id
-    attrs["model_cameras"] = list(MODEL_CAMERAS)
+    attrs["model_cameras"] = list(client.image_keys)
     attrs["model_action_horizon"] = client.action_horizon
     attrs["policy_hz"] = client.policy_hz
     attrs["chunk_size"] = args.execute_steps
     attrs["commands_per_chunk"] = args.execute_steps * client.substeps
     attrs["camera_image_note"] = (
         "obs/cam0_rgb_jpeg (ego), obs/cam1_rgb_jpeg (wrist), and obs/cam2_rgb_jpeg (exo) store "
-        "post-ROI 480x480 JPEGs; all three are FastWAM inputs, sampled on the fixed-rate 30Hz timeline"
+        f"post-ROI 480x480 JPEGs sampled on the fixed-rate 30Hz timeline; FastWAM inputs: {client.image_keys}"
     )
     recorder.file.flush()
 
 
 def run_hardware_loop(args: argparse.Namespace, client: FastWAMClient, preopened_hand=None):
-    """deploy_policy._run_hardware_loop with three model cameras and receding-horizon execution."""
+    """deploy_policy._run_hardware_loop with server-chosen model cameras and receding-horizon execution."""
     cameras = None
     executor = None
     pending_hand = preopened_hand
@@ -249,12 +255,14 @@ def run_hardware_loop(args: argparse.Namespace, client: FastWAMClient, preopened
         if args.record_h5:
             recorder = hw.InferenceRecorder(args.record_h5, args)
             annotate_recording(recorder, args, client)
-        cameras = OpenTeachCameraTriple(
+        cameras = OpenTeachModelCameras(
             args.camera_host, args.static_camera_port, args.wrist_camera_port,
             args.camera_timeout_ms, args.camera_max_age_ms, args.camera_rois,
-            exo_port=args.exo_camera_port)
+            exo_port=(
+                args.exo_camera_port
+                if "exo" in client.image_keys or recorder is not None else None))
         # Camera serial/freshness passes before the xArm SDK is opened/configured.
-        cameras.read_model_packets()
+        cameras.read_model_packets(client.image_keys)
         if recorder is not None:
             cameras.wait_for_recording_packets()
         hand_for_executor = pending_hand
@@ -276,7 +284,7 @@ def run_hardware_loop(args: argparse.Namespace, client: FastWAMClient, preopened
                 if terminal_stop_requested():
                     termination_reason = "discard" if discard_requested else "human_score"
                     break
-                packets = cameras.read_model_packets()
+                packets = cameras.read_model_packets(client.image_keys)
                 state = hw._validate_model_state(executor.read_state())
                 step_monotonic_ns = time.monotonic_ns()
                 if recorder is not None:
@@ -460,7 +468,7 @@ def main() -> None:
     # before the workstation opens either hardware SDK.
     client.check_contract(hw.EXECUTION_HZ, args.execute_steps)
     print(
-        f"[client] FastWAM server ready at {client.server}: horizon {client.action_horizon} @ "
+        f"[client] FastWAM server ready at {client.server}: cameras {client.image_keys}, horizon {client.action_horizon} @ "
         f"{client.policy_hz:g} Hz, executing {args.execute_steps} "
         f"({args.execute_steps / client.policy_hz:.2f} s) per chunk at {client.policy_hz * client.substeps:g} Hz"
     )

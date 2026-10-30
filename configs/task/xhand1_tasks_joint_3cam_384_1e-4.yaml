@@ -15,13 +15,13 @@ model:
 # scheduler
 lr_scheduler_type: "cosine"
 learning_rate: 1e-4
-num_epochs: 10 # ~187k train samples per epoch (3 tasks)
-max_steps: null
+num_epochs: 50 # ~187k train samples per epoch (3 tasks)
+max_steps: 30000
 log_every: 10
-save_every: 2000
-eval_every: 2000
+save_every: 5000
+eval_every: 5000
 
 # training
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 4
 weight_decay: 1e-2
 resume: null

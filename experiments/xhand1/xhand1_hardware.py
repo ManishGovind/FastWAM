@@ -45,7 +45,7 @@ INTERPOLATION_SUBSTEPS = max(1, int(round(EXECUTION_HZ / POLICY_HZ)))
 EE_DIM, HAND_DIM = 6, 12
 STATIC_SERIAL = "341222300710"   # ego cam  -> rgb_static
 WRIST_SERIAL = "334622071624"    # wrist cam -> rgb_gripper
-EXO_SERIAL = "341522301282"      # exo cam  -> recording only (FastWAM: also a model input)
+EXO_SERIAL = "341522301282"      # exo cam  -> recording only
 CAMERA_SOURCE_RGB_SHAPES = {
     "static": (720, 1280),
     "wrist": (480, 640),
@@ -1627,7 +1627,7 @@ class SafeRobotExecutor:
 
 
 def print_safety_constraints(args):
-    # FastWAM: banner title and the model RGB line describe the FastWAM client.
+    # FastWAM: banner title describes the FastWAM client.
     inference = "local CUDA model"
     if args.mode == "robot-client":
         inference = (
@@ -1659,7 +1659,7 @@ XHand torque caps [SDK unit] {XHAND_TOR_MAX.tolist()}
 XHand extra slew smoothing   none (range + PD/torque guards remain active)
 camera serials               ego={STATIC_SERIAL}, wrist={WRIST_SERIAL}, exo={EXO_SERIAL}
 camera RGB source            ego=1280x720, wrist=640x480, exo=OpenTeach native
-model/network RGB            exo=480x480, ego=480x480, wrist=480x480
+model/network RGB            ego=480x480, wrist=480x480
 camera ROI file              {args.camera_rois}
 camera timeout/max age       {args.camera_timeout_ms} ms / {args.camera_max_age_ms} ms
 workstation HDF5 recording   {getattr(args, 'record_h5', None) or 'disabled'}

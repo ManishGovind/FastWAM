@@ -3,8 +3,9 @@
 
 Adapted from experiments/r1lite/serve_fastwam_r1lite.py. The server owns
 FastWAM preprocessing, state normalization, inference, and action
-de-normalization. The robot client sends the measured 18-D state and the three
-post-ROI 480x480 camera JPEGs keyed by training camera name (exo, ego, wrist).
+de-normalization. The robot client sends the measured 18-D state and the
+post-ROI 480x480 camera JPEGs keyed by the training camera names
+(data.train.shape_meta.images, e.g. ego and wrist).
 Returned actions are ABSOLUTE targets, one per policy step (dataset fps /
 global_sample_stride):
     [x, y, z (m), rx, ry, rz (axis-angle rad), 12 XHand joint targets (rad)]
@@ -45,6 +46,7 @@ for path in (PROJECT_ROOT, SRC_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+from fastwam.datasets.dataset_utils import CenterCrop, ResizeSmallestSideAspectPreserving
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
@@ -259,23 +261,36 @@ def _decode_rgb(encoded: str, name: str) -> np.ndarray:
         raise ValueError(f"Invalid {name}: {exc}") from exc
 
 
-# Visual input assembled into the 384 * 320 mosaic
-def compose_robotwin_video(frames: list[torch.Tensor]) -> torch.Tensor:
-    """Same tensor ops as RobotVideoDataset._get: [T,C,H,W] per camera -> [T,C,384,320].
+# Visual input assembled into the video_size mosaic
+def compose_video(frames: list[torch.Tensor], concat_multi_camera: str | None, video_size: tuple[int, int]) -> torch.Tensor:
+    """Same tensor ops as RobotVideoDataset._get: [T,C,H,W] per camera -> [T,C,*video_size].
 
     The client already applied the collection ROI crop (480x480), so the frames
     here match the decoded training videos.
     """
-    top, left, right = (
-        transforms_F.resize(
-            frame,
-            size=list(size),
-            interpolation=transforms_F.InterpolationMode.BILINEAR,
-            antialias=True,
+    if concat_multi_camera == "robotwin":
+        top, left, right = (
+            transforms_F.resize(
+                frame,
+                size=list(size),
+                interpolation=transforms_F.InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            for frame, size in zip(frames, ROBOTWIN_SLOTS)
         )
-        for frame, size in zip(frames, ROBOTWIN_SLOTS)
-    )
-    return torch.cat([top, torch.cat([left, right], dim=-1)], dim=-2)
+        video = torch.cat([top, torch.cat([left, right], dim=-1)], dim=-2)
+    elif len(frames) > 1:
+        if concat_multi_camera == "horizontal":
+            video = torch.cat(frames, dim=-1)
+        elif concat_multi_camera == "vertical":
+            video = torch.cat(frames, dim=-2)
+        else:
+            raise ValueError(f"Invalid concat_multi_camera: {concat_multi_camera}")
+    else:
+        video = frames[0]
+    # Final resize and crop to video_size, as the dataset applies after composing.
+    size = {"img_w": video_size[1], "img_h": video_size[0]}
+    return CenterCrop(args=size)(ResizeSmallestSideAspectPreserving(args=size)(video))
 
 
 def _compose_config(config_path: Path, overrides: list[str]) -> DictConfig:
@@ -348,8 +363,11 @@ class FastWAMXHand1Policy:
         self.image_keys = [meta["key"] for meta in image_meta]
         self.image_shapes = {meta["key"]: tuple(meta["raw_shape"][1:]) for meta in image_meta}
         self.video_size = tuple(int(x) for x in data_cfg.video_size)
-        if data_cfg.get("concat_multi_camera") != "robotwin" or len(self.image_keys) != len(ROBOTWIN_SLOTS):
-            raise ValueError("xhand1 serving expects the 3-camera robotwin layout")
+        self.concat_multi_camera = data_cfg.get("concat_multi_camera")
+        if self.concat_multi_camera == "robotwin" and len(self.image_keys) != len(ROBOTWIN_SLOTS):
+            raise ValueError("concat_multi_camera='robotwin' requires exactly 3 cameras")
+        if len(self.image_keys) > 1 and self.concat_multi_camera not in {"robotwin", "horizontal", "vertical"}:
+            raise ValueError(f"Invalid concat_multi_camera: {self.concat_multi_camera}")
         # One action per `global_sample_stride` recorded frames.
         self.policy_hz = float(args.dataset_fps) / int(data_cfg.global_sample_stride)
 
@@ -446,9 +464,7 @@ class FastWAMXHand1Policy:
             for transform in transforms[key] if isinstance(transforms, dict) else transforms:
                 frame = transform(frame)
             frames.append(frame)
-        video = compose_robotwin_video(frames)  # [1, C, 384, 320] in [0, 1]
-        if tuple(video.shape[-2:]) != self.video_size:
-            raise ValueError(f"Composed image {tuple(video.shape[-2:])} does not match video_size {self.video_size}")
+        video = compose_video(frames, self.concat_multi_camera, self.video_size)  # [1, C, H, W] in [0, 1]
         return video, decoded_images
 
     # Proprio normalization
@@ -557,7 +573,7 @@ def build_app(policy: FastWAMXHand1Policy) -> FastAPI:
 
     @app.get("/metadata")
     def metadata() -> dict[str, object]:
-        top, left, right = policy.image_keys
+        height, width = policy.video_size
         return {
             "state_dim": STATE_DIM,
             "action_dim": ACTION_DIM,
@@ -566,7 +582,10 @@ def build_app(policy: FastWAMXHand1Policy) -> FastAPI:
             "policy_hz": policy.policy_hz,
             "image_keys": policy.image_keys,
             "image_shapes": {key: list(shape) for key, shape in policy.image_shapes.items()},
-            "camera_layout": f"post-ROI 480x480 inputs; {top} 320x256 above [{left} | {right}] 160x128",
+            "camera_layout": (
+                f"post-ROI inputs {policy.image_keys}; concat_multi_camera={policy.concat_multi_camera}; "
+                f"model image {height}x{width}"
+            ),
             "action_semantics": policy.action_semantics,
             "relative_dims": policy.relative_dims,
             "observations_dir": str(policy.recorder.root),

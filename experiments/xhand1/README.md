@@ -4,7 +4,7 @@ Adapted from `experiments/r1lite` (branch `real-world-mm`).
 
 - `serve_fastwam_xhand1.py` runs on the GPU host. It owns all FastWAM work:
   config + checkpoint loading, the training image path (processor
-  `val_transforms` per camera, then the robotwin mosaic), state normalization,
+  `val_transforms` per camera, then the configured camera layout), state normalization,
   inference, de-normalization, and clipping to the dataset action range.
 - `inference_xhand1_fastwam.py` runs on the robot workstation, on top of
   `xhand1_hardware.py`: the hardware layer of Dev_dex_hand_tactile
@@ -19,9 +19,11 @@ Adapted from `experiments/r1lite` (branch `real-world-mm`).
 
 ```text
 state:   [x, y, z (m), rx, ry, rz (axis-angle rad), 12 measured XHand joints (rad)]
-images:  post-ROI 480x480 JPEGs keyed by training camera: exo, ego, wrist
+images:  post-ROI 480x480 JPEGs keyed by the checkpoint's cameras, either
+           xhand1_tasks_joint_3cam_384_1e-4: exo above [ego | wrist], 384x320 (robotwin)
+           xhand1_tasks_joint_2cam224_1e-4:  ego | wrist, 224x448 (LIBERO 2-cam)
 actions: (32, 18), same layout as state but commanded hand joints
-cadence: 30 Hz data / global_sample_stride 3 = 10 Hz policy steps (3.2 s horizon)
+cadence: policy_hz = 30 Hz / global_sample_stride (stride 1: 32 steps = 1.07 s; stride 3: 3.2 s)
 ```
 
 Action semantics follow r1lite: the server reports `EVALUATION.action_semantics`
@@ -31,8 +33,9 @@ Action semantics follow r1lite: the server reports `EVALUATION.action_semantics`
 increments onto the measured state (rotation composed in the tool frame) and
 passes the other dims through as absolute targets.
 
-The client executes the first `--execute-steps` targets (default 8, i.e. 0.8 s,
-the same as a VPP chunk), interpolated to the 30 Hz executor, then re-plans. It
+The client executes the first `--execute-steps` targets (default 8: 0.8 s at
+stride 3, like a VPP chunk; 0.27 s at stride 1), interpolated to the 30 Hz
+executor, then re-plans. It
 checks `/metadata` before opening any SDK and refuses to start on a dimension,
 camera, absolute/relative, or cadence mismatch.
 
@@ -40,7 +43,8 @@ camera, absolute/relative, or cadence mismatch.
 
 ```bash
 export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
-# Prompts come from the configured datasets' meta/tasks.jsonl
+# Prompts come from the configured datasets' meta/tasks.jsonl; both variants share
+# the datasets and data/text_embeds_cache/xhand1_tasks, so either task works
 python scripts/precompute_text_embeds.py task=xhand1_tasks_joint_3cam_384_1e-4
 ```
 
@@ -63,9 +67,10 @@ bash experiments/xhand1/run_fastwam_server.sh \
 
 `--config` is the config snapshot training writes next to the checkpoint, so
 later edits under `configs/` or command-line overrides used for that run cannot
-diverge from the weights. `--config configs/task/xhand1_tasks_joint_3cam_384_1e-4.yaml`
+diverge from the weights. `--config configs/task/<task>.yaml` (either variant)
 also works (composed as `train.yaml` + `task=...`, the same way training does)
-when the configs are known to be unchanged since training.
+when the configs are known to be unchanged since training. The client takes
+its camera list from the server, so the same client command serves both.
 
 Robot workstation, in a Python env with numpy, opencv-python, scipy, pyzmq,
 h5py, `xarm-python-sdk`, and Open-Teach's XHand dependencies
