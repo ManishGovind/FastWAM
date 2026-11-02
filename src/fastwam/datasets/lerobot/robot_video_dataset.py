@@ -49,6 +49,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video_backend: Optional[str] = None,
         image_history_frames: int = 0,
         image_history_keys: Optional[list] = None,
+        action_history_steps: int = 0,
     ):
         self.lerobot_dataset = self.base_dataset_cls(
             dataset_dirs=dataset_dirs,
@@ -63,6 +64,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             video_backend=video_backend,
             image_history_frames=image_history_frames,
             image_history_keys=image_history_keys,
+            action_history_steps=action_history_steps,
         )
     
         self.num_frames = num_frames

@@ -134,11 +134,12 @@ class EmbedModalityRouter(nn.Module):
     * ``proprio`` ``[B, D]``    — ``video_expert.text_embedding`` of the proprio token
     * ``hist``    ``[B, M, D]`` — (``history=True``) patch tokens of the RGB observation history,
       attention-pooled with their own query
+    * ``act_hist`` ``[B, action_history_dim]`` — (``action_history_dim > 0``) flattened past actions + pad flags
     Each -> ``d``, concat -> MLP head. ``last_attn`` / ``last_attn_hist`` keep the pooling weights.
     """
 
     def __init__(self, *, dim: int, num_classes: int, d: int = 128, hidden: int = 256, dropout: float = 0.1,
-                 history: bool = False):
+                 history: bool = False, action_history_dim: int = 0):
         super().__init__()
         self.dim = int(dim)
         self.num_classes = int(num_classes)
@@ -150,12 +151,17 @@ class EmbedModalityRouter(nn.Module):
         if self.history:
             self.hist_proj = nn.Sequential(nn.LayerNorm(self.dim), nn.Linear(self.dim, d))
             self.q_hist = nn.Parameter(torch.randn(d) / d**0.5)
+        self.action_history_dim = int(action_history_dim)
+        if self.action_history_dim:
+            self.act_proj = nn.Sequential(nn.LayerNorm(self.action_history_dim), nn.Linear(self.action_history_dim, d))
+        n_parts = 3 + int(self.history) + int(self.action_history_dim > 0)
         self.head = nn.Sequential(
-            nn.SiLU(), nn.Dropout(dropout), nn.Linear((4 if self.history else 3) * d, hidden),
+            nn.SiLU(), nn.Dropout(dropout), nn.Linear(n_parts * d, hidden),
             nn.SiLU(), nn.Dropout(dropout), nn.Linear(hidden, self.num_classes),
         )
         linears = [self.r0_proj[1], self.text_proj[1], self.proprio_proj[1], self.head[2], self.head[5]]
-        for linear in linears + ([self.hist_proj[1]] if self.history else []):
+        linears += ([self.hist_proj[1]] if self.history else []) + ([self.act_proj[1]] if self.action_history_dim else [])
+        for linear in linears:
             nn.init.kaiming_normal_(linear.weight, nonlinearity="relu")
             nn.init.zeros_(linear.bias)
         self.last_attn: Optional[torch.Tensor] = None
@@ -177,6 +183,8 @@ class EmbedModalityRouter(nn.Module):
             wh = torch.softmax(hh @ self.q_hist / hh.shape[-1] ** 0.5, dim=1)
             self.last_attn_hist = wh.detach()
             parts.append((wh.unsqueeze(-1) * hh).sum(1))
+        if self.action_history_dim:
+            parts.append(self.act_proj(feats["act_hist"].to(dtype)))
         return self.head(torch.cat(parts, dim=-1)).float()
 
 

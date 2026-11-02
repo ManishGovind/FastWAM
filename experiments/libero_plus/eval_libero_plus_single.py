@@ -37,6 +37,7 @@ from experiments.libero.eval_infer import (
     plus_base_task,
     validate_eval_infer_model,
     RouterHistoryBuffer,
+    ActionHistoryBuffer,
 )
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
@@ -383,6 +384,7 @@ def _predict_action_chunk(
     input_h: int,
     model_device: str,
     history_images: Optional[torch.Tensor] = None,
+    action_history: Optional[ActionHistoryBuffer] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -421,6 +423,8 @@ def _predict_action_chunk(
     }
     if history_images is not None:
         infer_kwargs["history_images"] = history_images
+    if action_history is not None:
+        infer_kwargs.update(action_history.kwargs())
     action_attend_mode = cfg.EVALUATION.get("action_attend_mode", None)
     if action_attend_mode is not None:
         infer_kwargs["action_attend_mode"] = str(action_attend_mode)
@@ -462,6 +466,8 @@ def _predict_action_chunk(
                 cfg=cfg,
             )
     action = pred["action"]  # [T, D]
+    if action_history is not None:
+        action_history.push(action)
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -513,6 +519,7 @@ def run_single_episode(
     history = RouterHistoryBuffer(model, cfg, lambda o: _obs_to_model_input(
         o, cfg=cfg, processor=processor, width=input_w, height=input_h,
         device=model_device, dtype=model.torch_dtype)[0][0])
+    action_history = ActionHistoryBuffer(model, cfg)
     if use_action_ensembler:
         ensembler = ActionEnsembler()
         ensembler.reset()
@@ -549,6 +556,7 @@ def run_single_episode(
                 input_h=input_h,
                 model_device=model_device,
                 history_images=history.clip(),
+                action_history=action_history,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1

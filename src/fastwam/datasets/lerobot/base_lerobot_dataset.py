@@ -45,6 +45,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         # sample["history_pixel_values"] [N_keys, H, C, h, w] + sample["history_is_pad"] [H].
         image_history_frames: int = 0,
         image_history_keys: Optional[List[str]] = None,
+        # Past actions a_{t-K} .. a_{t-1} for the router (action window unchanged), returned normalized
+        # as sample["action_history"] [K, action_dim] (pad rows zeroed) + sample["action_history_is_pad"] [K].
+        action_history_steps: int = 0,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -61,6 +64,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.image_history_keys = list(image_history_keys or [])
         if self.image_history_frames > 0 and not self.image_history_keys:
             raise ValueError("`image_history_frames` > 0 requires `image_history_keys`.")
+        self.action_history_steps = int(action_history_steps)
+        if self.action_history_steps > 0 and len(shape_meta["action"]) != 1:
+            raise ValueError("`action_history_steps` > 0 expects a single action key.")
         self.processor = None  # Will be set externally
         metas = []
         for ds_dir in dataset_dirs:
@@ -126,7 +132,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.action_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
-            delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
+            hist_delta = [(-k * global_sample_stride) / fps for k in range(self.action_history_steps, 0, -1)]
+            delta_timestamps[meta["lerobot_key"]] = hist_delta + [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}
         if val_set_proportion < 1e-6:
@@ -277,6 +284,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             ) from last_exception
 
         history = self._split_image_history(lerobot_sample)
+        action_history = self._split_action_history(lerobot_sample)
 
         # Get data from lerobot, organized in nested dict
         sample = {
@@ -311,8 +319,29 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             sample = self.processor.preprocess(sample)
         if history is not None:
             sample.update(self._process_image_history(*history))
+        if action_history is not None:
+            sample.update(self._process_action_history(*action_history))
 
         return sample
+
+    def _split_action_history(self, lerobot_sample):
+        """Cut the leading K past actions off the action key (in place); None if disabled."""
+        k = self.action_history_steps
+        if k <= 0:
+            return None
+        lk = self.action_meta[0]["lerobot_key"]
+        full, pad = lerobot_sample[lk], lerobot_sample[f"{lk}_is_pad"]
+        lerobot_sample[lk], lerobot_sample[f"{lk}_is_pad"] = full[k:], pad[k:]
+        return full[:k].float(), pad[:k]
+
+    def _process_action_history(self, action, is_pad):
+        """Normalize like the action window (single key, no action_state_transforms); zero the pad rows."""
+        if self.processor is not None:
+            if self.processor.action_state_transforms is not None:
+                raise NotImplementedError("`action_history_steps` with action_state_transforms")
+            action = self.processor.normalizer.normalizers["action"][self.action_meta[0]["key"]].forward(action)
+        action = action.masked_fill(is_pad.bool().unsqueeze(-1), 0.0)
+        return {"action_history": action, "action_history_is_pad": is_pad}
 
     def _split_image_history(self, lerobot_sample):
         """Cut the leading history frames off the history keys (in place); None if disabled."""

@@ -53,6 +53,8 @@ def create_fastwam_joint_multimodal_select_new(
     router_arch: str = "mlp",
     router_history: bool = False,
     router_history_frames: int = 8,
+    router_action_history: bool = False,
+    router_action_history_steps: int = 32,
     mot_checkpoint_mixed_attn: bool = False,
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
@@ -167,6 +169,8 @@ def create_fastwam_joint_multimodal_select_new(
         router_arch=str(router_arch),
         router_history=bool(router_history),
         router_history_frames=int(router_history_frames),
+        router_action_history=bool(router_action_history),
+        router_action_history_steps=int(router_action_history_steps),
         **(_extra_kwargs or {}),
     )
 
