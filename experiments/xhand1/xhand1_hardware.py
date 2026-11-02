@@ -1479,10 +1479,16 @@ class SafeRobotExecutor:
 
     def _configure_arm(self):
         self._arm_healthy()
+        # if self.args.execution == "shadow":
+        #     code, moving = self.arm.get_is_moving()
+        #     _check_xarm("get_is_moving", code)
+        #     if moving:
+        #         raise SafetyViolation("xArm is already moving; shadow mode will not take control")
+        #     print("[robot] SHADOW: state + safety checks only; no position commands")
+        #     return
         if self.args.execution == "shadow":
-            code, moving = self.arm.get_is_moving()
-            _check_xarm("get_is_moving", code)
-            if moving:
+            # xArm SDK returns a plain bool here, not (code, value).
+            if self.arm.get_is_moving():
                 raise SafetyViolation("xArm is already moving; shadow mode will not take control")
             print("[robot] SHADOW: state + safety checks only; no position commands")
             return
