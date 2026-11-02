@@ -115,6 +115,18 @@ loss:
   lambda_depth: 1.0
   lambda_flow: 1.0
   lambda_action: 1.0
+# Learned per-stream identity on the future tokens (init randn*0.02).
+stream_embedding: false
+# Where it is added: timestep (adaLN of every block + head) | token (once, to the noisy future tokens).
+stream_embedding_mode: timestep
+# Router input: raw (flattened R0 latent + T5/proprio) | embed (video expert's patch/text embeddings, detached).
+router_input: raw
+# Router architecture on the embed inputs: mlp (EmbedModalityRouter) | transformer (TransformerModalityRouter,
+# CLS token) | transformer_query (QueryModalityRouter, one learned query per modality).
+router_arch: mlp
+# Embed router also reads the RGB observation history (needs data.train.image_history_frames > 0).
+router_history: false
+router_history_frames: ${oc.select:data.train.image_history_frames,8}
 # Straight-through Gumbel (gumbel only; router_reward / router_baseline* are unused):
 #   router_gumbel_hard        true  — forward = hard pick (select-mode topology), backward = soft
 #                             false — soft mixture in the forward pass too
