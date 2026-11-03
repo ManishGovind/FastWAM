@@ -128,6 +128,9 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # Router also reads the RGB observation history (embed router only; data: image_history_frames).
         router_history = bool(kwargs.pop("router_history", False))
         router_history_frames = int(kwargs.pop("router_history_frames", 8) or 8)
+        # Router also reads the past K executed actions (embed router only; data: action_history_steps).
+        router_action_history = bool(kwargs.pop("router_action_history", False))
+        router_action_history_steps = int(kwargs.pop("router_action_history_steps", 32) or 32)
         # Router architecture on the embed inputs: "mlp" (EmbedModalityRouter) | "transformer"
         # (TransformerModalityRouter, CLS token) | "transformer_query" (QueryModalityRouter, one query per modality).
         router_arch = str(kwargs.pop("router_arch", "mlp")).lower()
@@ -135,8 +138,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             raise ValueError(f"`router_input` must be 'raw' or 'embed', got {router_input!r}")
         if router_arch not in ("mlp", "transformer", "transformer_query"):
             raise ValueError(f"`router_arch` must be 'mlp', 'transformer' or 'transformer_query', got {router_arch!r}")
-        if router_arch != "mlp" and (router_input != "embed" or router_history):
-            raise ValueError(f"`router_arch: {router_arch}` requires `router_input: embed` and no `router_history`.")
+        if router_arch != "mlp" and (router_input != "embed" or router_history or router_action_history):
+            raise ValueError(f"`router_arch: {router_arch}` requires `router_input: embed` and no `router_(action_)history`.")
         if modality_prompt_target not in MODALITY_PROMPT_TARGETS:
             raise ValueError(
                 f"`modality_prompt_target` must be one of {MODALITY_PROMPT_TARGETS}, got {modality_prompt_target!r}"
@@ -192,6 +195,10 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.router_history_frames = router_history_frames   # = data.train.image_history_frames
         if router_history and router_input != "embed":
             raise ValueError("`router_history` requires `router_input: embed`.")
+        model.router_action_history = router_action_history
+        model.router_action_history_steps = router_action_history_steps   # = data.train.action_history_steps
+        if router_action_history and router_input != "embed":
+            raise ValueError("`router_action_history` requires `router_input: embed`.")
         # VAE latents of the history clip for the current call (set in training_loss / infer_*).
         model._router_history_latent = None
         # Per-sample [B, K] additive gate on (action rows, future cols); see
@@ -310,6 +317,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             router = EmbedModalityRouter(
                 dim=int(model.video_expert.hidden_dim), num_classes=len(enabled), hidden=hidden, dropout=dropout,
                 history=bool(getattr(model, "router_history", False)),
+                action_history_dim=(model.router_action_history_steps * (model.action_expert.action_dim + 1)
+                                    if getattr(model, "router_action_history", False) else 0),
             ).to(device=model.device, dtype=torch.float32)
             logger.info("Built EmbedModalityRouter classes=%s dim=%d (expert patch/text embeddings, "
                         "attention-pooled R0 + mean text + proprio)", list(enabled), router.dim)
@@ -411,6 +420,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         selected_modality: Optional[torch.Tensor] = None,
+        action_history: Optional[torch.Tensor] = None,
+        action_history_is_pad: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Return (choices [B], logits [B,K] or None, log_probs [B,K] or None).
 
@@ -478,6 +489,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 r0_latent=r0_latent,
                 context=context,
                 context_mask=context_mask,
+                action_history=action_history,
+                action_history_is_pad=action_history_is_pad,
             )
             temp = max(float(getattr(self, "stream_router_temperature", 1.0)), 1e-4)
             logits = self.modality_router(feats) / temp  
@@ -501,6 +514,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         r0_latent: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
+        action_history: Optional[torch.Tensor] = None,
+        action_history_is_pad: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Same R0 + MoT context FastWAM training uses — no adaptive pool, no token mean.
 
@@ -529,6 +544,10 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                     hist = r0_latent.unsqueeze(2).expand(-1, -1, n_lat, -1, -1)
                 with torch.no_grad():
                     feats["hist"] = ve.patch_embedding(hist.to(dtype)).flatten(2).transpose(1, 2)
+            if getattr(self, "router_action_history", False):
+                feats["act_hist"] = self._router_action_history_input(
+                    action_history, action_history_is_pad, r0_latent.shape[0], r0_latent.device
+                )
             return feats
         r0 = r0_latent.detach().float().flatten(1)
         ctx = context.detach().float()
@@ -935,6 +954,26 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         is_action_row[base.shape[-1] - int(action_seq_len):] = 1.0
         base_f = torch.zeros(base.shape, device=device).masked_fill(~base, float("-inf"))
         return (base_f[None] + is_action_row[None, :, None] * col_bias[:, None, :]).to(self.torch_dtype)
+
+    def _router_action_history_input(
+        self, action_history: Optional[torch.Tensor], action_history_is_pad: Optional[torch.Tensor], batch_size: int, device
+    ) -> torch.Tensor:
+        """[B, K*(A+1)]: past actions [B, K, A] (or unbatched [K, A]; pad rows zeroed) + is_pad flags [B, K].
+        No history given (e.g. trainer eval) = all pad, like an episode start."""
+        k, a = int(self.router_action_history_steps), int(self.action_expert.action_dim)
+        if action_history is None:
+            act = torch.zeros(batch_size, k, a, device=device)
+            pad = torch.ones(batch_size, k, device=device)
+        else:
+            act = torch.as_tensor(action_history).to(device=device, dtype=torch.float32)
+            pad = (torch.zeros(act.shape[:-1], device=device) if action_history_is_pad is None
+                   else torch.as_tensor(action_history_is_pad).to(device=device, dtype=torch.float32))
+            if act.ndim == 2:
+                act, pad = act.unsqueeze(0), pad.unsqueeze(0)
+            if act.shape[1:] != (k, a):
+                raise ValueError(f"`action_history` must be [B, {k}, {a}], got {tuple(act.shape)}")
+            act = act * (1.0 - pad).unsqueeze(-1)
+        return torch.cat([act.flatten(1), pad], dim=1)
 
     @torch.no_grad()
     def _encode_router_history(self, video: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -1399,6 +1438,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             context=context,
             context_mask=context_mask,
             selected_modality=selected_modality,
+            action_history=sample.get("action_history"),
+            action_history_is_pad=sample.get("action_history_is_pad"),
         )
         # MoT context: instruction (+ chosen modality sentence) + proprio. The router above
         # saw the context without the sentence.
@@ -1576,7 +1617,7 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         # Learned router, counterfactual reward: expected relative action loss under the policy.
         if counterfactual:
             # Per sample and stream: the action loss when the action reads that stream (same weights as loss_total).
-            cf = (self.loss_lambda_action * action_loss_per_copy * action_weight.float()[:, None]).detach()   # [B, K]
+            cf = (self.loss_lambda_action * action_loss_per_copy * action_weight.float().reshape(-1, 1)).detach()   # [B, K]; weight is [B] or scalar (eval)
             advantage = cf - cf.mean(dim=1, keepdim=True)            # relative to the other streams, same sample
             if self.router_adv_normalize and advantage.numel() > 1:
                 advantage = advantage / advantage.std().clamp_min(1e-6)
@@ -1899,6 +1940,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         first_frame_latents: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
+        action_history: Optional[torch.Tensor] = None,
+        action_history_is_pad: Optional[torch.Tensor] = None,
     ) -> str:
         """Argmax modality from the learned router using the same R0 + MoT context."""
         if self.modality_router is None:
@@ -1914,6 +1957,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             r0_latent=r0,
             context=context,
             context_mask=context_mask,
+            action_history=action_history,
+            action_history_is_pad=action_history_is_pad,
         )
         assert choices is not None
         return enabled[int(choices[0].item())]
@@ -1926,6 +1971,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         first_frame_latents: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
+        action_history: Optional[torch.Tensor] = None,
+        action_history_is_pad: Optional[torch.Tensor] = None,
     ) -> Optional[str]:
         """Pick MoT future stream for infer — same contract as training ``active_future``.
 
@@ -1962,6 +2009,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
                 first_frame_latents=first_frame_latents,
                 context=context,
                 context_mask=context_mask,
+                action_history=action_history,
+                action_history_is_pad=action_history_is_pad,
             )
             logger.info("Router selected active_future=%s", chosen)
             return chosen
@@ -1994,6 +2043,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         active_future: Optional[str] = None,
         prompt_text: Optional[str] = None,
         history_images: Optional[torch.Tensor] = None,
+        action_history: Optional[torch.Tensor] = None,
+        action_history_is_pad: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         del compile_action_infer, negative_prompt, text_cfg_scale
         self.eval()
@@ -2033,6 +2084,9 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             first_frame_latents=first_frames["rgb"],
             context=context,
             context_mask=context_mask,
+            # [K, A] normalized executed actions + [K] is_pad (router_action_history models only)
+            action_history=action_history,
+            action_history_is_pad=action_history_is_pad,
         )
         plain_context, plain_context_mask = context, context_mask
         if active_future is not None:
@@ -2090,6 +2144,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         active_future: Optional[str] = None,
         prompt_text: Optional[str] = None,
         history_images: Optional[torch.Tensor] = None,
+        action_history: Optional[torch.Tensor] = None,
+        action_history_is_pad: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         del compile_action_infer, negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
@@ -2139,6 +2195,9 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
             first_frame_latents=first_frames["rgb"],
             context=context,
             context_mask=context_mask,
+            # [K, A] normalized executed actions + [K] is_pad (router_action_history models only)
+            action_history=action_history,
+            action_history_is_pad=action_history_is_pad,
         )
         plain_context, plain_context_mask = context, context_mask
         if active_future is not None:

@@ -295,6 +295,9 @@ class RobotMultimodalVideoDataset(RobotVideoDataset):
         if video_rgb_history is not None:
             data["video_rgb_history"] = video_rgb_history
             data["history_is_pad"] = history_is_pad
+        if "action_history" in sample:
+            data["action_history"] = sample["action_history"]
+            data["action_history_is_pad"] = sample["action_history_is_pad"]
         if self.use_text_embed_cache:
             context, context_mask = self._get_cached_text_context(instruction)
             context[~context_mask] = 0.0

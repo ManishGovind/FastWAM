@@ -65,6 +65,8 @@ enabled_video_streams:
 cross_stream_attention: none
 # Learned per-stream identity (adaLN timestep embedding of the future tokens, init randn*0.02).
 stream_embedding: false
+# Where it is added: timestep (adaLN of every block + head) | token (once, to the noisy future tokens).
+stream_embedding_mode: timestep
 
 loss:
   # Per-stream video weights (train). Unused streams are omitted, not just zeroed.

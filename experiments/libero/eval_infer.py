@@ -259,6 +259,38 @@ def call_action_infer(
     return infer_method(**filtered)
 
 
+class ActionHistoryBuffer:
+    """Per-episode executed actions for ``router_action_history`` models (no-op for every other model).
+
+    Matches training (data.train.action_history_steps = K): the last K actions before the replan, in the
+    model's normalized action space -- the first ``replan_steps`` rows of each predicted chunk, i.e. the
+    executed ones (approximate with use_action_ensembler). Fewer than K so far -> front-padded with zeros
+    + is_pad, like LeRobot at an episode start.
+    """
+
+    def __init__(self, model, cfg):
+        on = bool(getattr(model, "router_action_history", False))
+        self.k = int(getattr(model, "router_action_history_steps", 0)) if on else 0
+        self.dim = int(model.action_expert.action_dim) if on else 0
+        self.replan = int(cfg.EVALUATION.get("replan_steps", 5))
+        self.rows = []
+
+    def push(self, pred_action) -> None:
+        if self.k:
+            self.rows.extend(pred_action.detach().float().reshape(-1, self.dim)[: self.replan].cpu())
+
+    def kwargs(self) -> dict:
+        """{"action_history": [K, A], "action_history_is_pad": [K]} or {}."""
+        if not self.k:
+            return {}
+        import torch
+        rows = self.rows[-self.k:]
+        n_pad = self.k - len(rows)
+        act = torch.cat([torch.zeros(n_pad, self.dim)] + ([torch.stack(rows)] if rows else []), dim=0)
+        pad = torch.cat([torch.ones(n_pad), torch.zeros(len(rows))])
+        return {"action_history": act, "action_history_is_pad": pad}
+
+
 class RouterHistoryBuffer:
     """Per-episode RGB history for ``router_history`` models (no-op for every other model).
 
