@@ -1,0 +1,73 @@
+# xArm7 + XHand1 real-world LeRobot v2.1 dataset, 2-cam (ego | wrist) RGB + depth + flow.
+# Multimodal counterpart of xhand1_tasks_2cam.yaml, laid out like libero_2cam_rgb_depth_flow.yaml.
+# 30 fps, 480x480 videos; depth/flow are precomputed per camera into their own video keys.
+# Action/state are 18-D and ABSOLUTE:
+#   arm: EE pose [x, y, z (m), rx, ry, rz (rad)], action[t] == state[t+1]
+#   hand: 12 joint targets (rad); action = commanded target, state = measured joints
+train:
+  _target_: fastwam.datasets.lerobot.robot_multimodal_video_dataset.RobotMultimodalVideoDataset
+  dataset_dirs:
+    - /home/wchi/Datasets/xhand_lerobot_fastwam_150demo/
+  shape_meta:
+    images:
+      # Order must match modality_camera_groups indices below.
+      # LIBERO 2-cam layout per stream: ego | wrist side by side, 224x224 each
+      - {key: ego, raw_shape: [3, 480, 480], shape: [3, 224, 224]}
+      - {key: wrist, raw_shape: [3, 480, 480], shape: [3, 224, 224]}
+      - {key: ego_depth, raw_shape: [3, 480, 480], shape: [3, 224, 224]}
+      - {key: wrist_depth, raw_shape: [3, 480, 480], shape: [3, 224, 224]}
+      - {key: ego_flow, raw_shape: [3, 480, 480], shape: [3, 224, 224]}
+      - {key: wrist_flow, raw_shape: [3, 480, 480], shape: [3, 224, 224]}
+    action:
+      - key: default
+        raw_shape: 18 # arm EE pose 6 + hand joints 12
+        shape: 18
+    state:
+      - key: default
+        raw_shape: 18
+        shape: 18
+  # pixel_values camera indices -> separate [C, T, 224, 448] videos (ego | wrist)
+  modality_camera_groups:
+    rgb: [0, 1]
+    depth: [2, 3]
+    flow: [4, 5]
+  # Unimodal future_key parity: each aux stream is [RGB_t0, modality_t>=1]
+  rgb_condition_modalities: [depth, flow]
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4 # 32 action, 9 video frames
+  video_size: [224, 448] # final resize video
+  camera_key: null
+  val_set_proportion: 0.0
+  is_training_set: true
+  skip_padding_as_possible: false
+  concat_multi_camera: "horizontal"
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: ${data.train.num_frames}
+    num_output_cameras: 6
+    action_output_dim: 18
+    proprio_output_dim: 18
+    # all dims are absolute: padded steps keep the replicated last action (hold pose),
+    # so none of them may be zeroed as deltas
+    delta_action_dim_mask: null
+
+    action_state_transforms: null
+    use_stepwise_action_norm: False
+    norm_default_mode: "z-score"
+    norm_exception_mode: null
+
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+
+    train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [224, 224]
+    val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size: [224, 224]
+  text_embedding_cache_dir: ./data/text_embeds_cache/xhand1_tasks
+  context_len: 128
