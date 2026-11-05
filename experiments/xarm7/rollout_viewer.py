@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Browse, play back, and score recorded xArm7 rollouts and demonstrations.
 
-Lists every *.hdf5 under --root (default data/rollouts/runs, where
+Lists every *.hdf5 under --root (default data/rollouts/combined, where
 xarm_fastwam_inference.py saves its episodes), shows each demo's metadata,
 plays the exo and wrist cameras (buffered in the browser and drawn every
-display frame), and edits the 0/50/100 trial score of inference episodes.
+display frame), and edits the 0-2 trial score of inference episodes.
 
-Two file layouts are read:
-  - inference episodes (xarm_fastwam_inference.py): datasets at the file root
-    (primary_images_jpeg, wrist_images_jpeg), shown as one demo, "episode".
+Layouts read:
+  - inference runs (xarm_fastwam_inference.py): one HDF5 per task with a
+    data/trial_N group per trial (scores editable here). Older per-trial files
+    with datasets at the file root also open, as a single trial "episode".
   - collected demos (xarm_data_collection.py): data/demo_N/obs/
     {agentview,eye_in_hand}_rgb_jpeg. These are read-only here, since they
     carry no trial score.
@@ -16,7 +17,7 @@ Two file layouts are read:
 Reads never take an HDF5 file lock. Score edits take the normal write lock.
 
 Usage (fastwam_xarm7 env):
-  python rollout_viewer.py [--root data/rollouts/runs] [--http-port 8766]
+  python rollout_viewer.py [--root data/rollouts/combined] [--http-port 8766]
 then open http://<this-host>:8766
 """
 
@@ -33,13 +34,14 @@ import h5py
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent  # experiments/xarm7/
-# Trial rubric from xarm_fastwam_inference.py (SCORE_KEYS).
-SCORE_LEVELS = {0: "no contact", 50: "touched", 100: "goal reached"}
+# Trial rubric from xarm_fastwam_inference.py (SCORE_LEVELS).
+SCORE_LEVELS = {0: "no grasp", 1: "grasp", 2: "grasp + place"}
+GOAL_SCORE = max(SCORE_LEVELS)
 # Stream id -> dataset paths to try, collected-demo layout first.
 CAMERAS = {
     "exo": ("obs/agentview_rgb_jpeg", "primary_images_jpeg"),
     "wrist": ("obs/eye_in_hand_rgb_jpeg", "wrist_images_jpeg"),
-    "ego": ("obs/ego_rgb_jpeg",),  # optional third camera in collected demos
+    "ego": ("obs/ego_rgb_jpeg", "ego_images_jpeg"),  # optional third camera
 }
 DEFAULT_HZ = 5.0  # inference control rate; collected demos store control_hz
 MAX_BATCH_FRAMES = 120
@@ -202,7 +204,8 @@ class RecordingStore:
         with self._open(path) as root:
             groups = _demo_groups(root)
             demos = [_demo_summary(key, groups[key]) for key in sorted(groups, key=_demo_sort_key)]
-            editable = "score" in root.attrs  # inference episodes carry a trial score
+            # inference trials carry a score; collected demos do not
+            editable = any("score" in g.attrs for g in groups.values())
         return {
             "path": str(path.relative_to(self.root)),
             "version": self._version(path),
@@ -214,7 +217,7 @@ class RecordingStore:
     def _demo(self, root, demo):
         group = _demo_groups(root).get(str(demo))
         if group is None:
-            raise FileNotFoundError(f"no demo {demo!r}")
+            raise FileNotFoundError(f"no trial {demo!r}")
         return group
 
     def timeline(self, relative, demo):
@@ -251,7 +254,7 @@ class RecordingStore:
 
     def set_score(self, relative, demo, score):
         if score != -1 and score not in SCORE_LEVELS:
-            raise ValueError("score must be 0, 50, 100, or -1 (unscored)")
+            raise ValueError("score must be 0-2, or -1 (unscored)")
         path = self.resolve(relative)
         try:
             root = h5py.File(path, "r+")
@@ -260,15 +263,15 @@ class RecordingStore:
                 "file is open for writing (a rollout is probably being recorded "
                 "to it); score it after the session ends") from exc
         with root:
-            if "score" not in root.attrs:
-                raise ValueError("only inference episodes can be scored here")
+            group = self._demo(root, demo)
+            if "score" not in group.attrs:
+                raise ValueError("only inference trials can be scored here")
             # Keep the rubric components consistent with the score.
-            root.attrs["score"] = int(score)
+            group.attrs["score"] = int(score)
             if score != -1:
-                root.attrs["touched"] = score >= 50
-                root.attrs["goal_reached"] = score == 100
-                root.attrs["success"] = score == 100
-            root.attrs["score_edited_time"] = time.time()
+                group.attrs["goal_reached"] = score == GOAL_SCORE
+                group.attrs["success"] = score == GOAL_SCORE
+            group.attrs["score_edited_time"] = time.time()
         return self.file_detail(relative)
 
 
@@ -308,7 +311,7 @@ figcaption{position:absolute;left:8px;top:6px;font-size:12px;background:#000a;pa
 <h1>Rollout viewer</h1>
 <label class="pick model">Model <select id="model"></select></label>
 <label class="pick">File <select id="file"></select></label>
-<label class="pick">Demo <select id="demo" disabled></select></label>
+<label class="pick">Trial <select id="demo" disabled></select></label>
 </header>
 <main id="main"><div class="empty">Choose a file.</div></main>
 <template id="playerTpl">
@@ -334,7 +337,7 @@ figcaption{position:absolute;left:8px;top:6px;font-size:12px;background:#000a;pa
 </template>
 <script>
 const $=id=>document.getElementById(id), enc=encodeURIComponent;
-const LEVELS={'-1':'unscored',0:'0 · no contact',50:'50 · touched',100:'100 · goal reached'};
+const LEVELS={'-1':'unscored',0:'0 · no grasp',1:'1 · grasp',2:'2 · grasp + place'};
 const NAMES={exo:'exo',wrist:'wrist',ego:'ego'};
 const CHUNK=60, AHEAD_S=3, KEEP=300;   // frames per request, read-ahead, frames kept around the playhead
 const S={files:[],filesKey:'',model:'',file:'',detail:null,demo:'',times:[],cams:[],ctx:{},frame:0,drawn:-1,
@@ -363,7 +366,7 @@ function fillFiles(){
  const sel=$('file'), shown=S.files.filter(f=>!S.model||f.model===S.model);
  sel.replaceChildren(new Option(`— choose a file (${shown.length}) —`,''));
  for(const f of shown){
-  const meta=f.read_error?'unreadable':`${f.demos} demos, ${f.scored} scored${f.mean_score!=null?', mean '+f.mean_score.toFixed(2):''}, ${fmtB(f.size_bytes)}${f.running?', RECORDING':''}`;
+  const meta=f.read_error?'unreadable':`${f.demos} trials, ${f.scored} scored${f.mean_score!=null?', mean '+f.mean_score.toFixed(2):''}, ${fmtB(f.size_bytes)}${f.running?', RECORDING':''}`;
   sel.add(new Option(`${f.path} — ${S.model?'':f.model+' · '}${meta}`,f.path));
  }
  sel.value=shown.some(f=>f.path===S.file)?S.file:'';
@@ -382,7 +385,7 @@ async function selectFile(path,keepDemo){
  try{
   const d=await api('api/file?path='+enc(path)); if(token!==S.token)return; S.detail=d; fillDemos();
   const pick=keepDemo&&S.demo?S.demo:(d.demos[0]&&d.demos[0].key);
-  if(pick)await selectDemo(pick,keepDemo); else $('main').innerHTML='<div class="empty">This file has no demos.</div>';
+  if(pick)await selectDemo(pick,keepDemo); else $('main').innerHTML='<div class="empty">This file has no trials.</div>';
  }catch(e){if(token===S.token)$('main').innerHTML=`<div class="empty err">${esc(e.message)}</div>`;}
 }
 function fillDemos(){
@@ -416,7 +419,7 @@ function renderPlayer(){
  $('play').onclick=()=>S.playing?stop():play();
  $('speed').value=String(S.speed); $('speed').onchange=e=>{S.speed=+e.target.value;};
  renderScore(); S.drawn=-1; seek(S.frame);
- if(!d.frames)$('msg').innerHTML='<span class="warn">This demo has no recorded frames.</span>';
+ if(!d.frames)$('msg').innerHTML='<span class="warn">This trial has no recorded frames.</span>';
 }
 function resetFrames(){for(const b of S.bitmaps.values())b.close();S.bitmaps.clear();S.pending.clear();S.drawn=-1;}
 const fkey=(c,i)=>c+':'+i;
@@ -484,11 +487,11 @@ requestAnimationFrame(loop);
 /* ---------- scoring with confirmation ---------- */
 function renderScore(){
  const d=demoInfo(), sel=$('scoreSel'); sel.replaceChildren();
- for(const s of [-1,0,50,100])sel.add(new Option(LEVELS[s],String(s)));
+ for(const s of [-1,0,1,2])sel.add(new Option(LEVELS[s],String(s)));
  sel.value=String(d.score); $('confirm').hidden=true;
  const editable=S.detail.editable&&d.status!=='running';
  sel.disabled=!editable; $('scoreSave').disabled=true;
- $('scoreNote').innerHTML=!S.detail.editable?'read-only: no trial score (collected demo)':d.status==='running'?'<span class="warn">still recording</span>':'';
+ $('scoreNote').innerHTML=!S.detail.editable?'read-only: no trial score (collected demos)':d.status==='running'?'<span class="warn">still recording</span>':'';
  sel.onchange=()=>{$('scoreSave').disabled=+sel.value===d.score;$('confirm').hidden=true;};
  $('scoreSave').onclick=()=>{
   $('confirmText').textContent=`Change ${S.file} / ${d.key} from "${LEVELS[d.score]}" to "${LEVELS[sel.value]}"?`;
@@ -594,7 +597,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", type=Path, default=ROOT / "data" / "rollouts" / "runs",
+    parser.add_argument("--root", type=Path, default=ROOT / "data" / "rollouts" / "combined",
                         help="directory searched recursively for *.hdf5 recordings")
     parser.add_argument("--http-host", default="0.0.0.0")
     parser.add_argument("--http-port", type=int, default=8766)

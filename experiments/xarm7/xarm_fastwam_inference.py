@@ -1,21 +1,21 @@
 """
-Cosmos Policy inference on xArm7, aligned with the official LIBERO/Cosmos
-training-time preprocessing and chunk execution pattern.
+FastWAM inference client for xArm7 (talks to serve_fastwam_xarm7.py).
 
-- Predict a chunk, queue it, execute one action at a time.
-- Reuse cosmos_utils.get_action for shared preprocessing (JPEG compression,
-  center crop, resize). We only do the collection-time crop + resize + BGR->RGB.
-- 7D joint-state proprio (matches training data).
-- Action: dx/dy/dz in meters, droll/dpitch/dyaw in radians, gripper in [-1,1];
-  applied as Cartesian pose delta.
+- Sends three 480x480 RGB views (primary/exo, wrist, ego) + 7D joint-state
+  proprio + task prompt to the server's /infer endpoint.
+- The server returns an (H, 7) chunk of ABSOLUTE targets at 15 Hz:
+  x, y, z (m), roll, pitch, yaw (rad), gripper (-1 open, +1 closed).
+  The first CHUNK_EXECUTE_STEPS are queued and executed at CONTROL_HZ.
 """
 
 import argparse
 import base64
 import math
 import os
+import queue
 import re
 import select
+import shutil
 import signal
 import sys
 import termios
@@ -58,6 +58,12 @@ def setup_logging(cfg, task_identifier, log_dir, run_id_note=None):
     return open(log_path, "w"), log_path, run_id
 
 
+def _text_attr(value):
+    if value is None:
+        return ""
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
 def jpeg_encode_image(image, quality=95):
     bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
@@ -88,10 +94,24 @@ def save_rollout_video(images, idx, success, task_description, log_file=None, fp
 # crop format: [width, height, x_offset, y_offset]
 WRISTCAM_CROP = [480, 480, 80, 0]
 EXO1_CROP = [248, 258, 194, 104]
+EGO_CROP = [696, 696, 323, 0]  # same as xarm_data_collection.py
 CROP_TARGET_SIZE = (480, 480)
 CAPTURE_FRAME_SIZE = (640, 480)
+EGO_CAPTURE_FRAME_SIZE = (1280, 720)
 WARMUP_FRAMES = 60
-CONTROL_HZ = 5
+# Training data is 15 Hz and the server's chunk is 32 steps at 15 Hz.
+CONTROL_HZ = 15
+CHUNK_EXECUTE_STEPS = 16  # first N actions of each chunk are executed before re-querying
+# Minimum commanded z (mm), from the latest cosmos-xarm deploy script
+# (training_demo_online_inference_rollouts_added.py: max(z, 185)). Training data
+# reaches z=174 mm, so this also trims the lowest part of the approach.
+Z_FLOOR_MM = 185.0
+# The client owns the cameras (a /dev/video device can only be opened once), so it
+# publishes the latest model-view frames (480x480 JPEG, exactly what the model sees)
+# here for experiments/xarm7/live_overlay.py. "" disables publishing.
+LIVE_FRAME_DIR = "/tmp/xarm_live"
+LIVE_FRAME_HZ = 10.0
+DEFAULT_CKPT_TAG = "fastwam_xarm7_30k"
 
 # z held at 300, matching the training distribution: across 130 demos in the
 # collected datasets every episode starts at 296.8-301.1mm (std 0.1-0.4mm), so
@@ -194,16 +214,17 @@ EXPERIMENT_STARTING_JOINT_POSITIONS = (
     (1.440, -28.250, -2.870, 23.488, -0.646, 51.728, 0.747),
 )
 
-# Return here after the final experiment.
-PARK_POSITION = EXPERIMENT_STARTING_JOINT_POSITIONS[0]
+# The one fixed home / starting configuration: the arm starts here, 'h' returns
+# here, and it parks here on exit. The rest of the list above is no longer used.
+HOME_JOINT_POSITION = EXPERIMENT_STARTING_JOINT_POSITIONS[0]
 
-# Task instructions, keyed by the sheet's T1/T2/T3 labels. These strings must
-# match the keys in the t5 embeddings pickle exactly — lookup is by exact dict
-# key, so a near-miss silently conditions the model on the wrong instruction.
+# Task instructions. These strings must match the prompts the server has cached
+# T5 embeddings for (models/xarm7_3task/*.pt); any other string makes
+# the server reject the request.
 TASKS = {
-    "t1": "put the carrot in the bowl",
-    "t2": "put the carrot on the plate",
-    "t3": "put the eggplant in the bowl",
+    "insert_bottle": "insert the bottle",
+    "stack_cubes": "stack the cubes",
+    "stack_cups": "stack the cups",
 }
 
 TCP_OFFSET = [0, 0, 0, 0, 0, 0]
@@ -214,6 +235,9 @@ TCP_OFFSET = [0, 0, 0, 0, 0, 0]
 #   *.txt          run logs
 ROLLOUTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "rollouts")
 OBSERVATIONS_DIR = os.path.join(ROLLOUTS_DIR, "observations")
+# One HDF5 per --name (new file per launch by default; reusing a name appends);
+# this is the viewer's default root.
+COMBINED_DIR = os.path.join(ROLLOUTS_DIR, "combined")
 
 
 def next_test_dir():
@@ -253,7 +277,7 @@ class PolicyEvalConfig:
     unnormalize_actions: bool = True
 
     chunk_size: int = 16
-    num_open_loop_steps: int = 16
+    num_open_loop_steps: int = CHUNK_EXECUTE_STEPS
     num_denoising_steps_action: int = 5
     num_denoising_steps_future_state: int = 5
     num_denoising_steps_value: int = 3
@@ -307,7 +331,75 @@ def crop_and_resize(frame, crop):
     return cv2.resize(cropped, CROP_TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
 
 
-def init_cameras(primary_id, wrist_id):
+class CameraStream:
+    """Reads a camera continuously in a background thread so frames are always fresh
+    (no stale V4L2 buffer) and publishes the cropped model view for the live overlay.
+    Drop-in for cv2.VideoCapture as used here: read(), grab(), release(), isOpened()."""
+
+    def __init__(self, cap, view, crop, publish_dir=None, publish_hz=LIVE_FRAME_HZ):
+        self.cap = cap
+        self.view = view
+        self.crop = crop
+        self.publish_dir = publish_dir or None
+        self.min_publish_interval = 1.0 / publish_hz
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stop = threading.Event()
+        if self.publish_dir:
+            os.makedirs(self.publish_dir, exist_ok=True)
+        self._thread = threading.Thread(target=self._loop, name=f"cam-{view}", daemon=True)
+        self._thread.start()
+
+    def _publish(self, frame):
+        view = crop_and_resize(frame, self.crop)
+        ok, buf = cv2.imencode(".jpg", view, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            return
+        tmp = os.path.join(self.publish_dir, f".{self.view}.tmp.jpg")
+        with open(tmp, "wb") as f:
+            f.write(buf.tobytes())
+        os.replace(tmp, os.path.join(self.publish_dir, f"{self.view}.jpg"))  # atomic
+
+    def _loop(self):
+        last_publish = 0.0
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.01)
+                continue
+            with self._lock:
+                self._frame = frame
+            now = time.monotonic()
+            if self.publish_dir and now - last_publish >= self.min_publish_interval:
+                last_publish = now
+                try:
+                    self._publish(frame)
+                except Exception as exc:  # noqa: BLE001 - never let publishing break inference
+                    print(f"[camera] {self.view}: live-frame publish failed: {exc}")
+                    self.publish_dir = None
+
+    def read(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._frame is not None:
+                    return True, self._frame.copy()
+            time.sleep(0.005)
+        return False, None
+
+    def grab(self):  # frames are already drained continuously
+        return True
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self.cap.release()
+
+
+def init_cameras(primary_id, wrist_id, ego_id, publish_dir=LIVE_FRAME_DIR):
     # Explicit V4L2 backend: OpenCV's default backend (GStreamer on this
     # box) fails to negotiate CAPTURE_FRAME_SIZE (1280x800) on at least one
     # of the two RealSense color streams and warmup_cameras() never gets a
@@ -315,9 +407,11 @@ def init_cameras(primary_id, wrist_id):
     # 1280x800 under V4L2.
     primary_cap = cv2.VideoCapture(primary_id, cv2.CAP_V4L2)
     wrist_cap = cv2.VideoCapture(wrist_id, cv2.CAP_V4L2)
+    ego_cap = cv2.VideoCapture(ego_id, cv2.CAP_V4L2)
     cameras = (
         ("primary", primary_id, primary_cap),
         ("wrist", wrist_id, wrist_cap),
+        ("ego", ego_id, ego_cap),
     )
     failed = [f"{name} camera id {cam_id}" for name, cam_id, cap in cameras if not cap.isOpened()]
     if failed:
@@ -325,22 +419,29 @@ def init_cameras(primary_id, wrist_id):
             cap.release()
         raise RuntimeError(
             "Could not open " + " and ".join(failed) +
-            ". Check /dev/video* and restart with --primary-cam-id/--wrist-cam-id."
+            ". Check /dev/video* and restart with --primary-cam-id/--wrist-cam-id/--ego-cam-id."
         )
 
-    for _, _, cap in cameras:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_FRAME_SIZE[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_FRAME_SIZE[1])
+    for name, _, cap in cameras:
+        size = EGO_CAPTURE_FRAME_SIZE if name == "ego" else CAPTURE_FRAME_SIZE
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return primary_cap, wrist_cap
+    return (
+        CameraStream(primary_cap, "exo", EXO1_CROP, publish_dir),
+        CameraStream(wrist_cap, "wrist", WRISTCAM_CROP, publish_dir),
+        CameraStream(ego_cap, "ego", EGO_CROP, publish_dir),
+    )
 
 
-def warmup_cameras(primary_cap, wrist_cap, num_frames=WARMUP_FRAMES):
-    ret1 = ret2 = False
-    for _ in range(num_frames):
+def warmup_cameras(primary_cap, wrist_cap, ego_cap, num_frames=WARMUP_FRAMES):
+    ret1 = ret2 = ret3 = False
+    time.sleep(2.0)  # let auto-exposure settle; the streams keep reading in the background
+    for _ in range(3):
         ret1, _ = primary_cap.read()
         ret2, _ = wrist_cap.read()
-    if not ret1 or not ret2:
+        ret3, _ = ego_cap.read()
+    if not ret1 or not ret2 or not ret3:
         raise RuntimeError(
             "Camera warmup failed. At least one configured camera opened but did not return frames."
         )
@@ -373,54 +474,42 @@ def get_gripper_value(arm):
     return pos / 850.0
 
 
+# Last gripper position commanded (0 closed, 850 open, None unset), so identical
+# commands are not re-sent every step. Reset per episode, since home_arm() reopens
+# the gripper physically and the cached value would otherwise be stale.
+_last_gripper_target = None
+
+
 def get_proprio(arm):
-    # Only joint angles are returned. The previous get_position() and
-    # get_gripper_value() calls here computed `pose` and `gripper` and then
-    # discarded both -- get_gripper_position() in particular is a Modbus
-    # round-trip (robot port 502) that ran at the 5Hz control rate for no
-    # effect, and gripper Modbus traffic is what the run loop hangs on.
-    abs_joint_state = arm.get_joint_states()[1][0]
+    """State fed to the model: [x, y, z (m), roll, pitch, yaw (rad), gripper (-1 open, +1 closed)].
 
-    return np.array([
-        abs_joint_state[0],
-        abs_joint_state[1],
-        abs_joint_state[2],
-        abs_joint_state[3],
-        abs_joint_state[4],
-        abs_joint_state[5],
-        abs_joint_state[6]
-    ], dtype=np.float32)
+    The 30k checkpoint was trained on end-effector pose + gripper state, NOT joint
+    angles (see dataset_stats.json state: x mean 0.416 m, roll mean 3.141 rad).
+    Roll is wrapped to [0, 2*pi) like the training data, so roll -180 deg -> pi.
+    Gripper comes from the last commanded target (no Modbus read in the loop);
+    it starts open because home_arm() reopens the gripper.
+    """
+    pose = arm.get_position(is_radian=False)[1]
+    x, y, z = (float(v) / 1000.0 for v in pose[:3])
+    roll = math.radians(float(pose[3])) % (2.0 * math.pi)
+    pitch = math.radians(float(pose[4]))
+    yaw = math.radians(float(pose[5]))
+    gripper = 1.0 if _last_gripper_target == 0 else -1.0
+    return np.array([x, y, z, roll, pitch, yaw, gripper], dtype=np.float32)
 
 
-def read_observation_images(primary_cap, wrist_cap):
+def read_observation_images(primary_cap, wrist_cap, ego_cap):
+    """Returns RGB uint8 480x480 (primary, wrist, ego), cropped exactly as at collection time."""
     ret1, primary = primary_cap.read()
     ret2, wrist = wrist_cap.read()
-    if not ret1 or not ret2:
+    ret3, ego = ego_cap.read()
+    if not ret1 or not ret2 or not ret3:
         raise RuntimeError("Camera read failed")
-    primary = crop_and_resize(primary, EXO1_CROP)
-    wrist = crop_and_resize(wrist, WRISTCAM_CROP)
-    primary = cv2.cvtColor(primary, cv2.COLOR_BGR2RGB)
-    wrist = cv2.cvtColor(wrist, cv2.COLOR_BGR2RGB)
-    # video_primary/video_wrist must be numpy arrays (imageio's
-    # append_data requires ndarray), so copy them BEFORE primary/wrist get
-    # reassigned to PIL Images below for the 256x256 model-input resize.
-    video_primary = primary.copy()
-    video_wrist = wrist.copy()
-    primary = Image.fromarray(primary).resize((256, 256), resample=0)
-    wrist = Image.fromarray(wrist).resize((256, 256), resample=0)
-
-    return (
-        np.asarray(primary, dtype=np.uint8),
-        np.asarray(wrist, dtype=np.uint8),
-        video_primary,
-        video_wrist,
-    )
-
-
-# Last gripper position commanded, so identical commands are not re-sent every
-# step. Reset at the start of each episode, since home_arm() reopens the
-# gripper physically and the cached value would otherwise be stale.
-_last_gripper_target = None
+    views = []
+    for frame, crop in ((primary, EXO1_CROP), (wrist, WRISTCAM_CROP), (ego, EGO_CROP)):
+        rgb = cv2.cvtColor(crop_and_resize(frame, crop), cv2.COLOR_BGR2RGB)
+        views.append(np.ascontiguousarray(rgb, dtype=np.uint8))
+    return tuple(views)
 
 
 def reset_gripper_command_cache():
@@ -428,67 +517,26 @@ def reset_gripper_command_cache():
     _last_gripper_target = None
 
 
-def execute_action_cartesian_position(arm, action, speed=15, radius=5.0):
+def _wrap_deg(angle_deg):
+    """Wrap to [-180, 180) as the xArm reports roll/pitch/yaw."""
+    return (angle_deg + 180.0) % 360.0 - 180.0
+
+
+def execute_action_cartesian_position(arm, action, speed=100):
+    """Send one ABSOLUTE target [x,y,z (m), roll,pitch,yaw (rad), gripper (-1 open/+1 closed)]."""
     global _last_gripper_target
-    current_position = arm.get_position(is_radian=False)[1]
-
-    lin_mm = np.asarray(action[:3], dtype=float) * 1000.0
-    _rot_deg = np.asarray(action[3:6], dtype=float) * 180.0 / math.pi
-
-    current_position[0] += lin_mm[0]
-    current_position[1] += lin_mm[1]
-    current_position[2] += lin_mm[2]
-
-    
-
-    print(f"Executing action with linear (mm) before: {current_position[:3]}, {action[6]}")
-
-    gripper = float(action[6])
-    # if _last_gripper_target != 0 and gripper > 0 :
-    #     # Open/unset -> close transition: this is the grasp step, so nudge
-    #     # down 25mm before closing so the gripper actually descends onto the
-    #     # object instead of closing 25mm short of it. _last_gripper_target
-    #     # is left alone here — the send/cache-update logic further down
-    #     # handles that; mutating it here would make it equal to
-    #     # target_gripper_pos early and silently skip the actual close command.
-    #     current_position[2] = current_position[2] - 25
-    #     print(f"Grasp z offset (25mm down): {current_position[:3]}")
-    # # if current_position[2] <= 215:    # if current_position[2] <= 195:
-    # #     print(f"Executing action with offset  : {current_position[:3]}")
-    # #     current_position[2] = current_position[2] - 5
-    # #     current_position[2] = max(current_position[2], 180)  # enforce a minimum height of 150mm to avoid collisions
-        
-    # print(f"Executing action with linear (mm) after : {current_position[:3]}")
-    #     current_position[2] = current_position[2] - 5
-    #     current_position[2] = max(current_position[2], 175)  # enforce a minimum height of 150mm to avoid collisions
-    # print(f"Executing action with linear (mm) after : {current_position[:3]}")
-    
+    x, y, z = (float(v) * 1000.0 for v in action[:3])
+    roll, pitch, yaw = (_wrap_deg(math.degrees(float(v))) for v in action[3:6])
+    if z < Z_FLOOR_MM:
+        z = Z_FLOOR_MM
 
     arm.set_position(
-        x=current_position[0], 
-        y=current_position[1],
-        z=current_position[2],
-        roll=current_position[3],
-        pitch=current_position[4],
-        yaw=current_position[5],
-        relative=False,
-        wait=False,
-        speed=100,
+        x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw,
+        relative=False, wait=False, speed=speed,
     )
-
-    x, y, z, roll, pitch, yaw = current_position
-    executed_action = [
-        float(x),
-        float(y),
-        float(z),
-        float(roll),
-        float(pitch),
-        float(yaw),
-        -1.0,
-    ]
+    executed_action = [x, y, z, roll, pitch, yaw, -1.0]
 
     gripper = float(action[6])
-
     if gripper > 0:
         target_gripper_pos = 0
     elif gripper < 0:
@@ -496,16 +544,9 @@ def execute_action_cartesian_position(arm, action, speed=15, radius=5.0):
     else:
         target_gripper_pos = None
 
-    
-
+    # Only command the gripper when the target changes: re-sending every step
+    # saturates the gripper's Modbus channel and wedges the SDK lock.
     if target_gripper_pos is not None:
-        # Only command the gripper when the target actually changes. This used
-        # to fire every step: action[6] is a continuous float so it is almost
-        # never exactly 0, meaning a Modbus write went out at 5Hz for the whole
-        # episode, re-sending a position the gripper was already holding. That
-        # saturates the gripper's Modbus channel and is what wedges the SDK
-        # lock. replay_inference.py already guards the same way.
-        
         if target_gripper_pos != _last_gripper_target:
             arm.set_gripper_position(target_gripper_pos, wait=False)
             _last_gripper_target = target_gripper_pos
@@ -514,15 +555,30 @@ def execute_action_cartesian_position(arm, action, speed=15, radius=5.0):
     return executed_action
 
 
-def save_episode_data(cfg, collected_data, task_description, success=False, episode_idx=0, log_file=None):
-    rollout_data_dir = os.path.join(cfg.local_log_dir, "rollout_data")
-    os.makedirs(rollout_data_dir, exist_ok=True)
-    ep_filename = (
-        f"episode_data--suite=xarm--{DATE_TIME}--task=0--ep={episode_idx}"
-        f"--success={success}--{cfg.run_id_note}.hdf5"
-    )
-    ep_filepath = os.path.join(rollout_data_dir, ep_filename)
-    with h5py.File(ep_filepath, "w") as f:
+def session_hdf5_path(name):
+    """This session's HDF5 under COMBINED_DIR (read by rollout_viewer.py)."""
+    return os.path.join(COMBINED_DIR, f"{_safe_run_name(name)}.hdf5")
+
+
+def save_episode_data(cfg, collected_data, task_description, h5_path,
+                      model_tag, log_file=None):
+    """Append one trial as the next data/trial_<N> group of the named HDF5.
+
+    The file is opened in append mode and closed again per trial, so earlier
+    trials survive a later crash. N continues past the highest existing trial
+    number, so repeated runs never overwrite each other.
+    """
+    os.makedirs(os.path.dirname(h5_path), exist_ok=True)
+    with h5py.File(h5_path, "a") as f:
+        models = {m for m in _text_attr(f.attrs.get("model_name")).split(",") if m}
+        models.add(model_tag)
+        f.attrs["model_name"] = ",".join(sorted(models))
+        data = f.require_group("data")
+        used = [int(k.split("_")[1]) for k in data if re.fullmatch(r"trial_\d+", k)]
+        trial_name = f"trial_{max(used, default=0) + 1}"
+        g = data.create_group(trial_name)
+        g.attrs["model_name"] = model_tag
+        g.attrs["run_dir_time"] = DATE_TIME
         for k, v in collected_data.items():
             if isinstance(v, np.ndarray):
                 is_image = v.ndim == 4 and v.shape[-1] == 3 and v.dtype == np.uint8
@@ -537,27 +593,40 @@ def save_episode_data(cfg, collected_data, task_description, success=False, epis
                     # attribute 'dtype'".
                     jpeg_arr = np.empty(len(jpeg_list), dtype=object)
                     jpeg_arr[:] = jpeg_list
-                    f.create_dataset(k + "_jpeg", data=jpeg_arr, dtype=dt)
+                    g.create_dataset(k + "_jpeg", data=jpeg_arr, dtype=dt)
                 else:
-                    f.create_dataset(k, data=v)
+                    g.create_dataset(k, data=v)
             else:
-                f.attrs[k] = v
-        f.attrs["task_description"] = task_description
-    log_message(f"[episode] saved {ep_filepath}", log_file)
-    return ep_filepath
+                g.attrs[k] = v
+        g.attrs["task_description"] = task_description
+    log_message(f"[episode] saved {trial_name} to {h5_path}", log_file)
+    return trial_name
 
 
-def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
+def delete_trial_from_hdf5(h5_path, trial_name):
+    with h5py.File(h5_path, "r+") as f:
+        if trial_name in f["data"]:
+            del f["data"][trial_name]
+
+
+def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
         save_debug_image=False, debug_image_dir=None, obs_dir=None, log_file=None,
-        server_endpoint=None):
+        server_endpoint=None, keys=None):
+    """Run live inference until the operator presses Enter (stop) or d (discard).
+
+    Returns (..., step_count, stop_reason) with stop_reason "stop" or "discard".
+    """
+    stop_reason = "stop"
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     rollout_primary_images = []
     rollout_wrist_images = []
     future_image_predictions_list = []
     primary_images_list = []
     wrist_images_list = []
+    ego_images_list = []
     proprio_list = []
     actions_list = []
+    recording_start_time = time.time()
     debug_saved = False
     query_idx = 0
     step_count = 0
@@ -567,6 +636,14 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
 
     try:
         while True:
+            # Keys are only checked here, between whole steps, so the recorded
+            # images / proprio / actions always stay the same length.
+            if keys is not None:
+                reason = keys.poll_stop()
+                if reason:
+                    stop_reason = reason
+                    log_message(f"[episode] operator {reason}", log_file)
+                    break
             # V4L2 ignores CAP_PROP_BUFFERSIZE=1. After the multi-second
             # get_action call, the buffer is full of stale frames; drain
             # them so the read that actually feeds the model is fresh.
@@ -574,9 +651,10 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
                 for _ in range(5):
                     primary_cap.grab()
                     wrist_cap.grab()
-            primary, wrist, video_primary, video_wrist = read_observation_images(primary_cap, wrist_cap)
-            rollout_primary_images.append(video_primary.copy())
-            rollout_wrist_images.append(video_wrist.copy())
+                    ego_cap.grab()
+            primary, wrist, ego = read_observation_images(primary_cap, wrist_cap, ego_cap)
+            rollout_primary_images.append(primary.copy())
+            rollout_wrist_images.append(wrist.copy())
 
             if save_debug_image and not debug_saved:
                 out_dir = debug_image_dir or "."
@@ -591,6 +669,7 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
             if cfg.data_collection:
                 primary_images_list.append(primary.copy())
                 wrist_images_list.append(wrist.copy())
+                ego_images_list.append(ego.copy())
                 proprio_list.append(proprio.copy())
 
             if len(action_queue) == 0:
@@ -600,26 +679,39 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
                                 cv2.cvtColor(primary, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(os.path.join(obs_dir, "wrist", f"{query_idx:05d}.png"),
                                 cv2.cvtColor(wrist, cv2.COLOR_RGB2BGR))
+                    os.makedirs(os.path.join(obs_dir, "ego"), exist_ok=True)
+                    cv2.imwrite(os.path.join(obs_dir, "ego", f"{query_idx:05d}.png"),
+                                cv2.cvtColor(ego, cv2.COLOR_RGB2BGR))
                     query_idx += 1
 
                 print(primary.shape, wrist.shape, proprio.shape)
                 obs_snapshot = {
                     "primary_image": _encode_jpeg_b64(primary),
                     "wrist_image": _encode_jpeg_b64(wrist),
+                    "ego_image": _encode_jpeg_b64(ego),
                     "state": proprio.tolist(),
                     "prompt": task,
                 }
                 out = get_action_from_fastwam(obs_snapshot, server_endpoint)
+                acts = out["actions"]
+                log_message(
+                    f"[query {query_idx}] state={np.round(proprio, 4).tolist()} "
+                    f"first_action={np.round(acts[0], 4).tolist()} "
+                    f"last_action={np.round(acts[-1], 4).tolist()}",
+                    log_file,
+                )
                 if "future_image_predictions" in out:
                     future_image_predictions_list.append(out["future_image_predictions"])
-                action_queue.extend(out["actions"])
-                log_message(f"[episode] queued new chunk (size={len(out['actions'])})", log_file)
+                # maxlen would silently keep the LAST N of a longer chunk; take the first N.
+                action_queue.extend(out["actions"][:cfg.num_open_loop_steps])
+                log_message(f"[episode] queued new chunk (size={len(action_queue)} of {len(out['actions'])})", log_file)
             
             # predicted_actions = np.asarray(list(action_queue), dtype=np.float32)
             # summed_action = np.sum(predicted_actions, axis=0, dtype=np.float32)
 
 
             action = action_queue.popleft()
+            log_message(f"[step {step_count + 1}] target={np.round(np.asarray(action), 4).tolist()}", log_file)
 
             # Closer-loop variant: clearing the queue here forces a re-query
             # every step (only out["actions"][0] used).
@@ -646,6 +738,11 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
         collected_data = {
             "primary_images": np.stack(primary_images_list, axis=0),
             "wrist_images": np.stack(wrist_images_list, axis=0),
+            "ego_images": np.stack(ego_images_list, axis=0),
+            # Attrs read by experiments/xarm7/rollout_viewer.py (playback rate + duration).
+            "control_hz": float(CONTROL_HZ),
+            "recording_start_time": recording_start_time,
+            "recording_end_time": time.time(),
             "proprio": np.stack(proprio_list, axis=0),
             "actions": np.stack(actions_list, axis=0) if actions_list else np.zeros((0, 7), dtype=np.float32),
             "success": False,
@@ -664,7 +761,8 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
             if future_wrist_images:
                 collected_data["future_wrist_images"] = np.stack(future_wrist_images, axis=0)
 
-    return rollout_primary_images, rollout_wrist_images, future_image_predictions_list, collected_data, step_count
+    return (rollout_primary_images, rollout_wrist_images, future_image_predictions_list,
+            collected_data, step_count, stop_reason)
 
 
 def _model_tag(ckpt_path):
@@ -734,48 +832,38 @@ def home_arm(arm, starting_joint_position):
     arm.set_gripper_position(850, wait=True)
 
 
-# Partial-scoring rubric: 50 points for touching the target object, 50 for
-# reaching the goal. Keys are deliberately letters rather than the old 1/0 —
-# '1' used to mean "success", and reusing it would silently record 50 points
-# where the operator meant 100.
-SCORE_KEYS = {
-    "n": (False, False),   #   0 — no contact with the target
-    "t": (True, False),    #  50 — touched the target, goal not reached
-    "g": (True, True),     # 100 — touched and reached the goal
+# Trial scoring rubric: after stopping a trial the operator presses one digit
+# key to record how far it got (edit the labels here if the meaning changes).
+SCORE_LEVELS = {
+    0: "no grasp",
+    1: "grasp",
+    2: "grasp + place",
 }
-TOUCH_POINTS = 50
-GOAL_POINTS = 50
-MAX_TRIAL_SCORE = TOUCH_POINTS + GOAL_POINTS
+MAX_TRIAL_SCORE = max(SCORE_LEVELS)
+GOAL_SCORE = MAX_TRIAL_SCORE  # full-credit outcome (grasp + place), recorded as `success`
 
 
-def trial_score(touched, goal):
-    return TOUCH_POINTS * bool(touched) + GOAL_POINTS * bool(goal)
+class KeyReader:
+    """Single-keypress stdin reader for the whole session.
 
-
-class TestEndKeyListener:
-    """Background stdin watcher for the rubric keys in SCORE_KEYS ('n', 't',
-    'g'). On a recognised key, records touched/goal and sends SIGUSR1 to the
-    main process so the SIGUSR1 handler halts the arm and breaks run()'s
-    loop. Unrecognised keys are ignored, so an old-habit '1' does nothing
-    visible rather than scoring the trial wrongly. SIGINT is reserved for
-    true emergency stop (Ctrl+C) — see the handlers in main(). Restores
-    terminal on exit. Falls back to a no-op if stdin isn't a tty."""
+    A background thread (terminal in cbreak mode, so no Enter is needed and
+    Ctrl+C still raises SIGINT) pushes every key onto a queue. Enter arrives as
+    "\n"; letters are lower-cased."""
 
     def __init__(self):
-        self.result = {"decided": False, "touched": False, "goal": False}
+        self._q = queue.Queue()
         self._stop = threading.Event()
         self._thread = None
         self._fd = None
         self._old_settings = None
 
     def __enter__(self):
+        self._fd = sys.stdin.fileno()
         if sys.stdin.isatty():
             try:
-                self._fd = sys.stdin.fileno()
                 self._old_settings = termios.tcgetattr(self._fd)
                 tty.setcbreak(self._fd)
             except (termios.error, OSError):
-                self._fd = None
                 self._old_settings = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -785,7 +873,7 @@ class TestEndKeyListener:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
-        if self._fd is not None and self._old_settings is not None:
+        if self._old_settings is not None:
             try:
                 termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
             except (termios.error, OSError):
@@ -793,25 +881,44 @@ class TestEndKeyListener:
         return False
 
     def _loop(self):
-        if self._fd is None:
-            return
         while not self._stop.is_set():
             try:
                 r, _, _ = select.select([self._fd], [], [], 0.1)
+                if not r:
+                    continue
+                data = os.read(self._fd, 1)
             except (OSError, ValueError):
                 return
-            if not r:
-                continue
+            if not data:
+                return
+            ch = data.decode("utf-8", "ignore")
+            self._q.put("\n" if ch == "\r" else ch.lower())
+
+    def flush(self):
+        while True:
             try:
-                ch = sys.stdin.read(1)
-            except (OSError, ValueError):
+                self._q.get_nowait()
+            except queue.Empty:
                 return
-            verdict = SCORE_KEYS.get(ch.lower() if ch else "")
-            if verdict is not None:
-                self.result["decided"] = True
-                self.result["touched"], self.result["goal"] = verdict
-                os.kill(os.getpid(), signal.SIGUSR1)
-                return
+
+    def get(self, valid=None):
+        """Block until a key in `valid` (all keys if None) is pressed."""
+        while True:
+            ch = self._q.get()
+            if valid is None or ch in valid:
+                return ch
+
+    def poll_stop(self):
+        """Non-blocking: "stop" on Enter, "discard" on d, else None. Other keys are dropped."""
+        while True:
+            try:
+                ch = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            if ch == "\n":
+                return "stop"
+            if ch == "d":
+                return "discard"
 
 
 def _move_to(src_path, dst_dir, dst_basename):
@@ -841,13 +948,15 @@ def _resize_images_to_shape(images, target_shape):
     return resized
 
 
-def save_test_artifacts(cfg, test_dir, model_tag, success, task, log_file,
+def save_test_artifacts(cfg, test_dir, h5_path, model_tag, success, task, log_file,
                         rollout_primary_images, rollout_wrist_images,
                         future_image_predictions_list, collected_data, step_count,
-                        touched=False, score=0):
-    """Save rollout videos + episode HDF5 into test_dir, embedding the rubric
-    score + model tag in filenames so a single ls makes the run readable.
-    `success` is goal-reached, i.e. the full-credit outcome."""
+                        score=0):
+    """Save the rollout video into test_dir (rubric score + model tag in the
+    filename) and append the trial to the HDF5 at h5_path as
+    the next group data/trial_<N>. `success` is goal-reached, i.e. the
+    full-credit outcome. Returns the new trial's group name (None if no data)."""
+    trial_name = None
     suffix = f"--score={score}--success={success}--model={model_tag}"
 
     if rollout_primary_images:
@@ -865,34 +974,19 @@ def save_test_artifacts(cfg, test_dir, model_tag, success, task, log_file,
         # Non-array values land in the hdf5 attrs, so the rubric components
         # are recoverable from the episode file alone.
         collected_data["success"] = success
-        collected_data["touched"] = bool(touched)
         collected_data["goal_reached"] = bool(success)
         collected_data["score"] = int(score)
-        ep_path = save_episode_data(
-            cfg, collected_data, task_description=task,
-            success=success, episode_idx=0, log_file=log_file,
+        trial_name = save_episode_data(
+            cfg, collected_data, task_description=task, h5_path=h5_path,
+            model_tag=model_tag, log_file=log_file,
         )
-        _move_to(ep_path, test_dir, f"episode_data{suffix}.hdf5")
         log_message(f"[test] saved data for {step_count} steps", log_file)
-
-
-def _prompt_num_tests(max_tests):
-    while True:
-        raw = input(
-            f"How many test runs would you like to perform? (1-{max_tests}) "
-        ).strip()
-        try:
-            n = int(raw)
-            if 0 < n <= max_tests:
-                return n
-        except ValueError:
-            pass
-        print(f"Please enter an integer from 1 to {max_tests}.")
+    return trial_name
 
 
 def _parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--server_endpoint", default="http://0.0.0.0:8777/infer",
+    p.add_argument("--server_endpoint", default="http://127.0.0.1:8777/infer",
                    help="FastWAM server /infer endpoint")
     p.add_argument("--ckpt_tag", default=None,
                    help="Override the model tag used in log/file names (label for the "
@@ -906,18 +1000,19 @@ def _parse_args():
             f"{k}={v!r}" for k, v in TASKS.items()
         ),
     )
-    p.add_argument(
-        "--start_position",
-        type=int,
-        choices=range(1, len(EXPERIMENT_STARTING_JOINT_POSITIONS) + 1),
-        default=1,
-        metavar=f"1-{len(EXPERIMENT_STARTING_JOINT_POSITIONS)}",
-        help="One-based experiment position to start from (default: 1).",
-    )
     p.add_argument("--primary-cam-id", type=int, default=18,
                    help="OpenCV camera index for exo1 / primary_image.")
     p.add_argument("--wrist-cam-id", type=int, default=4,
                    help="OpenCV camera index for wristcam / wrist_image.")
+    p.add_argument("--live-frame-dir", default=LIVE_FRAME_DIR,
+                   help="Directory where the latest exo/wrist/ego model-view JPEGs are published "
+                        "for experiments/xarm7/live_overlay.py ('' disables).")
+    p.add_argument("--name", default=None,
+                   help="Name of the HDF5 to write (combined/<name>.hdf5). A new name "
+                        "creates a new file; an existing name appends new trials to "
+                        "it. Default: <task>_<ckpt_tag>_<timestamp> (always new).")
+    p.add_argument("--ego-cam-id", type=int, default=10,
+                   help="OpenCV camera index for the ego camera / ego_image.")
     return p.parse_args()
 
 
@@ -925,23 +1020,17 @@ def main():
     args = _parse_args()
     deploy_dir = os.path.dirname(os.path.abspath(__file__))
 
-    cfg = PolicyEvalConfig(
-        ckpt_path=os.path.join(deploy_dir, "/home/skapse/workspace/cosmos-xarm/cosmos-deploy/real-world-model-weights/cosmos_predict2_2b_480p_real_world_xarm_put_carrot_in_bowl_5hz/checkpoints/iter_000008000/model.pt"),
-        dataset_stats_path=os.path.join(deploy_dir, "/home/skapse/workspace/cosmos-xarm/cosmos-deploy/real-world-model-weights/cosmos_predict2_2b_480p_real_world_xarm_put_carrot_in_bowl_5hz/dataset_statistics.json"),
-        t5_text_embeddings_path=os.path.join(deploy_dir, "t5_embeddings.pkl"),
-    )
-    model_tag = args.ckpt_tag if args.ckpt_tag else _model_tag(cfg.ckpt_path)
+    cfg = PolicyEvalConfig()
+    model_tag = args.ckpt_tag if args.ckpt_tag else DEFAULT_CKPT_TAG
 
     task = TASKS[args.task]
+    h5_path = session_hdf5_path(args.name or f"{args.task}_{model_tag}_{DATE_TIME}")
     robot_ip = "192.168.1.198"
     primary_cam_id = args.primary_cam_id    # exo1 -> primary_image
     wrist_cam_id = args.wrist_cam_id        # wristcam -> wrist_image
+    ego_cam_id = args.ego_cam_id            # ego -> ego_image
     save_debug_image = False
 
-
-    start_position_index = args.start_position - 1
-    remaining_positions = len(EXPERIMENT_STARTING_JOINT_POSITIONS) - start_position_index
-    num_tests = _prompt_num_tests(remaining_positions)
 
     runs_root = os.path.join(deploy_dir, cfg.local_log_dir, "runs")
     # Task goes in the run dir name too — the same model gets evaluated on
@@ -951,7 +1040,7 @@ def main():
     print(f"\n[run] saving rollouts to {run_dir}")
     print(f"[run] model tag: {model_tag}")
     print(f"[run] task: {args.task} = {task!r}")
-    print(f"[run] performing {num_tests} test(s)\n")
+    print(f"[run] HDF5: {h5_path}" + (" (exists: appending new trials)" if os.path.exists(h5_path) else " (new file)"))
 
     log_file, _, run_id = setup_logging(
         cfg,
@@ -960,8 +1049,7 @@ def main():
         run_id_note=cfg.run_id_note,
     )
     log_message(
-        f"[run] run_dir={run_dir} model={model_tag} num_tests={num_tests} "
-        f"start_position={args.start_position} task={args.task} ({task!r})",
+        f"[run] run_dir={run_dir} model={model_tag} task={args.task} ({task!r})",
         log_file,
     )
 
@@ -969,16 +1057,13 @@ def main():
     model = None
     dataset_stats = None
 
-    primary_cap, wrist_cap = init_cameras(primary_cam_id, wrist_cam_id)
-    warmup_cameras(primary_cap, wrist_cap)
-    arm = init_arm(
-        robot_ip,
-        EXPERIMENT_STARTING_JOINT_POSITIONS[start_position_index],
-    )
+    primary_cap, wrist_cap, ego_cap = init_cameras(primary_cam_id, wrist_cam_id, ego_cam_id, args.live_frame_dir)
+    warmup_cameras(primary_cap, wrist_cap, ego_cap)
+    arm = init_arm(robot_ip, HOME_JOINT_POSITION)
 
     # Capture the original terminal mode so the SIGINT handler can restore
-    # it before hard-exit. Without this, Ctrl+C while TestEndKeyListener has
-    # stdin in cbreak mode leaves the terminal unable to echo typed input.
+    # it before hard-exit. Without this, Ctrl+C while KeyReader has stdin in
+    # cbreak mode leaves the terminal unable to echo typed input.
     orig_term_settings = None
     if sys.stdin.isatty():
         try:
@@ -996,9 +1081,8 @@ def main():
                 pass
 
     # Ctrl+C is the safety override: halt the arm and hard-exit immediately,
-    # no labeling, no save. SIGUSR1 is the normal end-of-test signal sent by
-    # the keypress listener — it raises KeyboardInterrupt which run()'s
-    # internal try/except unwinds gracefully so we can label and save.
+    # no labeling, no save. Every other control is a normal keypress read by
+    # KeyReader.
     def _sigint_handler(signum, frame):
         log_message("[run] SIGINT (Ctrl+C) — emergency stop, hard exit", log_file)
         try:
@@ -1008,127 +1092,125 @@ def main():
         _restore_terminal()
         os._exit(1)
 
-    def _sigusr1_handler(signum, frame):
-        try:
-            arm.set_state(4)
-        except Exception:
-            pass
-        raise KeyboardInterrupt
-
     signal.signal(signal.SIGINT, _sigint_handler)
-    signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
-    trial_scores = []  # (position_number, touched, goal, score) per trial
+    records = []  # one dict per trial saved this session; the last is what 'd' discards
+    at_home = True  # init_arm() has just moved to HOME_JOINT_POSITION
+
+    def discard_record(rec):
+        if rec["trial"] is not None:
+            delete_trial_from_hdf5(rec["h5_path"], rec["trial"])
+        shutil.rmtree(rec["test_dir"], ignore_errors=True)
+        shutil.rmtree(rec["obs_dir"], ignore_errors=True)
+        log_message(f"[run] discarded {rec['trial']} (score {rec['score']}) from {rec['h5_path']}", log_file)
+        print(f"Discarded {rec['trial']} (score {rec['score']}).")
+
+    def print_controls():
+        print("\nControls:")
+        print("  Enter  start live inference (press Enter again to stop it)")
+        print("  0-2    after a stop, score the trial: " + ", ".join(
+            f"{k}={v}" for k, v in SCORE_LEVELS.items()))
+        print("  d      discard: during inference, abort and drop the current trial;")
+        print("         otherwise drop the most recent saved trial")
+        print("  h      move the arm to the home position")
+        print("  q      quit (arm must be at home)")
+        print("  Ctrl+C EMERGENCY STOP: halts the arm and exits immediately")
 
     try:
-        for test_num in range(1, num_tests + 1):
-            position_index = start_position_index + test_num - 1
-            position_number = position_index + 1
-            starting_joint_position = EXPERIMENT_STARTING_JOINT_POSITIONS[position_index]
-            print(f"\n========== Test {test_num}/{num_tests} ==========")
-            print(f"Experiment position {position_number} (joint deg): {starting_joint_position}")
-            print("Set up the scene. During inference, press one of:")
-            print("    n = no contact with target      (  0)")
-            print("    t = touched target, no goal     ( 50)")
-            print("    g = touched AND reached goal    (100)")
-            print("Ctrl+C is an EMERGENCY STOP — arm halts and the script exits immediately.")
-            input("Press Enter to start inference...")
+        with KeyReader() as keys:
+            print_controls()
+            print(f"\nReady at home. {len(records)} trial(s) saved this session.")
+            while True:
+                key = keys.get(valid={"\n", "h", "d", "q"})
 
-            test_dir = os.path.join(run_dir, f"test_{position_number}")
-            os.makedirs(test_dir, exist_ok=True)
+                if key == "h":
+                    try:
+                        home_arm(arm, HOME_JOINT_POSITION)
+                        at_home = True
+                        log_message("[run] moved to home position", log_file)
+                        print("Arm at home.")
+                    except Exception as e:
+                        log_message(f"[run] home error: {e}", log_file)
+                    continue
 
-            # Auto-incremented per-test obs dir with primary/ and wrist/ subdirs
-            # already created. Without this, cv2.imwrite silently no-ops because
-            # the subdirectories don't exist.
-            obs_dir = next_test_dir()
+                if key == "d":
+                    if records:
+                        discard_record(records.pop())
+                    else:
+                        print("Nothing to discard.")
+                    continue
 
-            log_message(
-                f"[test {position_number}] starting joint position={starting_joint_position}",
-                log_file,
-            )
+                if key == "q":
+                    if not at_home:
+                        print("Arm is not at home — press h first (clear the workspace).")
+                        continue
+                    break
 
-            rollout_primary_images = []
-            rollout_wrist_images = []
-            future_image_predictions_list = []
-            collected_data = None
-            step_count = 0
-
-            with TestEndKeyListener() as listener:
+                # Enter: run one live-inference trial.
+                if not at_home:
+                    print("Arm is not at home — press h first (clear the workspace).")
+                    continue
+                obs_dir = next_test_dir()  # primary/ wrist/ subdirs already created
+                keys.flush()
+                print("\nLive inference. Enter = stop, d = discard, Ctrl+C = EMERGENCY STOP.")
+                log_message("[run] starting live inference", log_file)
+                (rollout_primary_images, rollout_wrist_images,
+                 future_image_predictions_list, collected_data, step_count,
+                 stop_reason) = run(
+                    cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
+                    save_debug_image=save_debug_image,
+                    debug_image_dir=os.path.join(deploy_dir, "rollouts"),
+                    obs_dir=obs_dir,
+                    log_file=log_file,
+                    server_endpoint=args.server_endpoint,
+                    keys=keys,
+                )
+                # Halt any queued arm motion immediately while we score / save.
                 try:
-                    (rollout_primary_images, rollout_wrist_images,
-                     future_image_predictions_list, collected_data, step_count) = run(
-                        cfg, model, dataset_stats, arm, primary_cap, wrist_cap, task,
-                        save_debug_image=save_debug_image,
-                        debug_image_dir=os.path.join(deploy_dir, "rollouts"),
-                        obs_dir=obs_dir,
-                        log_file=log_file,
-                        server_endpoint=args.server_endpoint,
-                    )
-                except KeyboardInterrupt:
+                    arm.set_state(4)
+                except Exception:
                     pass
+                at_home = False
 
-            # Halt any queued arm motion immediately while we save / prompt.
-            try:
-                arm.set_state(4)
-            except Exception:
-                pass
+                if stop_reason == "discard" or step_count == 0:
+                    shutil.rmtree(obs_dir, ignore_errors=True)
+                    log_message("[run] trial discarded before saving", log_file)
+                    print("Trial discarded. Press h to go home.")
+                    continue
 
-            if listener.result["decided"]:
-                touched = listener.result["touched"]
-                success = listener.result["goal"]
-                score = trial_score(touched, success)
-                log_message(
-                    f"[test {position_number}] keypress label touched={touched} "
-                    f"goal={success} score={score}",
-                    log_file,
+                print(f"\nStopped after {step_count} steps. Score it: "
+                      + ", ".join(f"{k}={v}" for k, v in SCORE_LEVELS.items())
+                      + "  (d = discard)")
+                scored = keys.get(valid=set("".join(map(str, SCORE_LEVELS)) + "d"))
+                if scored == "d":
+                    shutil.rmtree(obs_dir, ignore_errors=True)
+                    log_message("[run] trial discarded at scoring prompt", log_file)
+                    print("Trial discarded. Press h to go home.")
+                    continue
+
+                score = int(scored)
+                success = score == GOAL_SCORE
+                n = 1 + len([d for d in os.listdir(run_dir) if d.startswith("test_")])
+                test_dir = os.path.join(run_dir, f"test_{n}")
+                trial_name = save_test_artifacts(
+                    cfg, test_dir, h5_path, model_tag, success, task, log_file,
+                    rollout_primary_images, rollout_wrist_images,
+                    future_image_predictions_list, collected_data, step_count,
+                    score=score,
                 )
-            else:
-                # run() returned without a rubric keypress. Ctrl+C would have
-                # hard-exited before reaching here, so this is the rare
-                # "loop ended naturally" case — score 0 and keep going.
-                touched = False
-                success = False
-                score = 0
-                log_message(
-                    f"[test {position_number}] no label, defaulting to score=0",
-                    log_file,
-                )
-
-            trial_scores.append((position_number, touched, success, score))
-            print(f"[test {position_number}] score {score}/{MAX_TRIAL_SCORE}  "
-                  f"(running {sum(s for *_, s in trial_scores)}/"
-                  f"{MAX_TRIAL_SCORE * len(trial_scores)})")
-
-            save_test_artifacts(
-                cfg, test_dir, model_tag, success, task, log_file,
-                rollout_primary_images, rollout_wrist_images,
-                future_image_predictions_list, collected_data, step_count,
-                touched=touched, score=score,
-            )
-            log_message(f"[test {position_number}] saved to {test_dir}", log_file)
-
-            if test_num == num_tests:
-                break
-
-            # Re-home for the next test so the arm is parked while the
-            # user re-stages the scene.
-            try:
-                next_starting_joint_position = EXPERIMENT_STARTING_JOINT_POSITIONS[position_index + 1]
-                home_arm(arm, next_starting_joint_position)
-                log_message(
-                    f"[test {position_number}] moved to next starting joint position="
-                    f"{next_starting_joint_position}",
-                    log_file,
-                )
-            except Exception as e:
-                log_message(f"[test {test_num}] re-home error: {e}", log_file)
+                records.append({"trial": trial_name, "score": score, "test_dir": test_dir,
+                                "obs_dir": obs_dir, "h5_path": h5_path})
+                log_message(f"[run] saved {trial_name} score={score} to {test_dir}", log_file)
+                print(f"Saved {trial_name}: score {score}/{MAX_TRIAL_SCORE} ({SCORE_LEVELS[score]}); "
+                      f"running {sum(r['score'] for r in records)}/{MAX_TRIAL_SCORE * len(records)}. "
+                      "Press h to go home.")
     finally:
         _restore_terminal()
         try:
             arm.set_state(4)
             arm.set_mode(0)
             arm.set_state(0)
-            home_arm(arm, PARK_POSITION)
+            home_arm(arm, HOME_JOINT_POSITION)
             log_message("[run] home reached", log_file)
             arm.set_gripper_enable(False)
             arm.disconnect()
@@ -1136,22 +1218,22 @@ def main():
             log_message(f"[run] cleanup error: {e}", log_file)
         primary_cap.release()
         wrist_cap.release()
+        ego_cap.release()
 
-    if trial_scores:
-        total = sum(s for *_, s in trial_scores)
-        possible = MAX_TRIAL_SCORE * len(trial_scores)
-        touched_n = sum(1 for _, t, _, _ in trial_scores if t)
-        goal_n = sum(1 for _, _, g, _ in trial_scores if g)
+    if records:
+        total = sum(r["score"] for r in records)
+        possible = MAX_TRIAL_SCORE * len(records)
+        completions = sum(1 for r in records if r["score"] == GOAL_SCORE)
         summary = (
-            f"[run] {args.task} {model_tag}: {total}/{possible} = "
-            f"{100.0 * total / possible:.1f}%  "
-            f"(touched {touched_n}/{len(trial_scores)}, "
-            f"goal {goal_n}/{len(trial_scores)})"
+            f"[run] {args.task} {model_tag}: "
+            f"success rate {100.0 * completions / len(records):.1f}% "
+            f"({completions} completions), "
+            f"accuracy {100.0 * total / possible:.1f}%"
         )
         print("\n" + "=" * len(summary))
         print(summary)
-        for pos, t, g, s in trial_scores:
-            print(f"    position {pos:2d}: touched={int(t)} goal={int(g)} score={s:3d}")
+        for r in records:
+            print(f"    {r['trial']}: score={r['score']}/{MAX_TRIAL_SCORE} ({SCORE_LEVELS[r['score']]})")
         print("=" * len(summary))
         log_message(summary, log_file)
 

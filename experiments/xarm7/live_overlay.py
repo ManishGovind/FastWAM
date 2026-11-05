@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
-"""Overlay a recorded HDF5 frame on a live xArm7 camera.
+"""Overlay a first-frame reference PNG on a live Open-Teach camera.
 
-Point --hdf5 at a recording with exo/wrist images: an inference episode from
-xarm_fastwam_inference.py or a demo file from xarm_data_collection.py. The live
-frame goes through the same crop/resize/JPEG round trip as the collection and
-inference scripts (crops imported from xarm_data_collection.py), so both sides
-line up in the 480x480 view the model sees.
+References are the exported XHand demo first frames in
+data/xhand_demo_first_frame_data/frames/, named
+<task>__episode_<N>__<ego|exo|wrist>__frame_<K>.png (already 480x480). The live
+frame goes through the same ROI crop/resize as deploy; references that are
+already 480x480 are used as-is, so both sides line up in the model's view.
 
-The browser UI picks the reference file (Model and File dropdowns over the
-recordings under --root), switches demos and frames, changes opacity, and
-selects blend, outline, or side-by-side display.
+The browser UI picks task and demo (episode), changes opacity, and selects
+blend, outline, or side-by-side display.
 
-The camera is opened directly (V4L2), so stop data collection, inference and
-any other camera user first.
-
-Usage (fastwam_xarm7 env):
-  python live_overlay.py --camera exo [--hdf5 <file>.hdf5]
+Usage (with Open-Teach cameras publishing):
+  python experiments/xarm7/live_overlay.py --camera cam0 [--task clean_the_whiteboard --demo 1]
+xArm7 (the inference client owns the cameras and publishes frames to /tmp/xarm_live,
+so start the client first):
+  python experiments/xarm7/live_overlay.py --camera xarm_exo --task stack_cubes --demo 1
+Match a recorded rollout (e.g. restage the object positions of trial 4 of an earlier
+eval): pass its HDF5; --demo N is trial N and frame 0 is the start of the trial:
+  python experiments/xarm7/live_overlay.py --camera xarm_exo \
+      --hdf5 experiments/xarm7/data/rollouts/combined/stack_cubes_30k.hdf5 --demo 4
+Without a client running you can add --direct to open /dev/video yourself.
 then open http://<this-host>:8765
 """
 
 import argparse
+import base64
 import json
+import pickle
+import re
 import signal
 import socket
 import threading
@@ -31,46 +38,60 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import cv2
-import h5py
 import numpy as np
 
-from rollout_viewer import (  # same model naming and file layouts as the rollout viewer
-    CAMERAS as STREAM_PATHS,
-    _demo_groups,
-    _model_label,
-)
-from xarm_data_collection import (
-    CAPTURE_FRAME_SIZE,
-    CROP_TARGET_SIZE,
-    EXO1_CROP,
-    WRISTCAM_CROP,
-    crop_and_resize,
-)
+ROOT = Path(__file__).resolve().parents[2]  # FastWAM/
+DEFAULT_FRAMES = ROOT / "data" / "xhand_demo_first_frame_data" / "frames"
 
-ROOT = Path(__file__).resolve().parent  # experiments/xarm7/
-
-CAMERA_TARGET_SIZE = CROP_TARGET_SIZE[0]
+# Camera constants and ROIs mirror the Open-Teach deploy setup (camera_rois.json
+# in vpp_real); keep them in sync if the deploy-time transform changes.
+CAMERA_TARGET_SIZE = 480
 CAMERA_JPEG_QUALITY = 95
 
-# --camera -> /dev/video index and crop, the same defaults as the collection
-# and inference scripts.
+# cam{i} is published on port 10005+i (Open-Teach configs/network.yaml).
+# "view" is the camera name used in the reference frame file names.
 CAMERAS = {
-    "exo": {"device": 18, "crop": EXO1_CROP},
-    "wrist": {"device": 4, "crop": WRISTCAM_CROP},
+    "cam0": {"serial": "341222300710", "port": 10005, "view": "ego",
+             "roi": {"x": 323, "y": 0, "size": 696, "source_width": 1280, "source_height": 720,
+                     "mode": "square_crop_resize"}},
+    "cam1": {"serial": "334622071624", "port": 10006, "view": "wrist",
+             "roi": {"x": 115, "y": 0, "size": 480, "source_width": 640, "source_height": 480,
+                     "mode": "full_frame_resize"}},
+    "cam2": {"serial": "341522301282", "port": 10007, "view": "exo",
+             "roi": {"x": 194, "y": 104, "size": 258, "source_width": 640, "source_height": 480,
+                     "mode": "square_crop_resize"}},
 }
-
-
-def _camera_transform(camera):
-    return {
-        "crop": CAMERAS[camera]["crop"],
-        "source_width": CAPTURE_FRAME_SIZE[0],
-        "source_height": CAPTURE_FRAME_SIZE[1],
-    }
+# xArm7 cameras read directly from /dev/video* with the collection-time crops from
+# experiments/xarm7/xarm_data_collection.py (crop = [width, height, x, y]).
+# Use with references exported by scripts/export_xarm_first_frames.py.
+XARM_CAMERAS = {
+    "xarm_exo": {"video_id": 18, "view": "exo", "capture": (640, 480), "crop": [248, 258, 194, 104]},
+    "xarm_wrist": {"video_id": 4, "view": "wrist", "capture": (640, 480), "crop": [480, 480, 80, 0]},
+    "xarm_ego": {"video_id": 10, "view": "ego", "capture": (1280, 720), "crop": [696, 696, 323, 0]},
+}
+# The inference client (xarm_fastwam_inference.py) owns the cameras while it runs and
+# publishes the latest model-view frames here as <exo|wrist|ego>.jpg.
+DEFAULT_LIVE_DIR = Path("/tmp/xarm_live")
+DEFAULT_XARM_FRAMES = ROOT / "data" / "xarm7_first_frame_data" / "frames"
+TOPIC = b"rgb_image "
+FRAME_RE = re.compile(r"^(?P<task>.+)__episode_(?P<episode>\d+)__(?P<view>[a-z]+)__frame_(?P<frame>\d+)\.png$")
 
 
 def _transform_camera_for_model(name, source_bgr, transform):
-    """Same crop/resize/JPEG round trip as the data scripts; returns BGR."""
-    resized = crop_and_resize(source_bgr, transform["crop"])
+    """Same crop/resize/JPEG round trip as deploy_policy; returns BGR."""
+    if transform["mode"] == "full_frame_resize":
+        cropped = source_bgr
+        resize_source = min(source_bgr.shape[:2])
+    else:
+        x, y, size = transform["x"], transform["y"], transform["size"]
+        cropped = source_bgr[y:y + size, x:x + size]
+        if cropped.shape[:2] != (size, size):
+            raise ValueError(f"{name} ROI produced {cropped.shape[:2]}")
+        resize_source = size
+    interpolation = (
+        cv2.INTER_AREA if resize_source >= CAMERA_TARGET_SIZE else cv2.INTER_LINEAR)
+    resized = cv2.resize(
+        cropped, (CAMERA_TARGET_SIZE, CAMERA_TARGET_SIZE), interpolation=interpolation)
     ok, encoded = cv2.imencode(
         ".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), CAMERA_JPEG_QUALITY])
     if not ok:
@@ -79,8 +100,8 @@ def _transform_camera_for_model(name, source_bgr, transform):
 
 
 def _demo_sort_key(name):
-    suffix = name.rsplit("_", 1)[-1]
-    return (0, int(suffix)) if suffix.isdigit() else (1, name)
+    task, _, episode = name.rpartition("__episode_")
+    return (task, int(episode)) if episode.isdigit() else (name, 0)
 
 
 def _to_model_view(name, bgr, transform):
@@ -88,10 +109,7 @@ def _to_model_view(name, bgr, transform):
     height, width = bgr.shape[:2]
     if (width, height) == (transform["source_width"], transform["source_height"]):
         return _transform_camera_for_model(name, bgr, transform), None
-    if height == width:  # collected demos are 480x480, inference episodes 256x256
-        if height != CAMERA_TARGET_SIZE:
-            bgr = cv2.resize(bgr, (CAMERA_TARGET_SIZE, CAMERA_TARGET_SIZE),
-                             interpolation=cv2.INTER_LINEAR)
+    if (height, width) == (CAMERA_TARGET_SIZE, CAMERA_TARGET_SIZE):
         return bgr, None
     side = min(height, width)
     x, y = (width - side) // 2, (height - side) // 2
@@ -117,128 +135,163 @@ def _reference_edges(bgr, min_edge_px):
     return cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1) > 0
 
 
-class DemoStore:
-    def __init__(self, path, camera, transform):
-        self.path = Path(path).expanduser().resolve()
-        if not self.path.is_file():
-            raise FileNotFoundError(f"HDF5 file does not exist: {self.path}")
-        # locking=False: a default read lock held for the overlay's lifetime
-        # would stop a running script from appending to this file.
-        self.file = h5py.File(self.path, "r", locking=False)
+class FrameStore:
+    """First-frame PNGs for one camera view, grouped into demos named
+    <task>__episode_<N>; each demo holds its frames sorted by frame index."""
+
+    def __init__(self, frames_dir, view, transform):
+        self.path = Path(frames_dir).expanduser().resolve()
+        if not self.path.is_dir():
+            raise FileNotFoundError(f"frames directory does not exist: {self.path}")
+        self.view = view
         self.transform = transform
-        self.lock = threading.Lock()
-        groups = _demo_groups(self.file)
-        self.groups = groups
-        # Per demo, the first of this camera's dataset paths that exists.
-        self.paths = {}
-        for name, group in groups.items():
-            for candidate in STREAM_PATHS[camera]:
-                if isinstance(group.get(candidate), h5py.Dataset):
-                    self.paths[name] = candidate
-                    break
-        self.demos = sorted(self.paths, key=_demo_sort_key)
-        if not self.demos:
-            raise ValueError(
-                f"no {camera} images ({' or '.join(STREAM_PATHS[camera])}) in {self.path}")
-        self.image_key = self.paths[self.demos[0]]
+        self.frames = {}
+        for image in self.path.glob("*.png"):
+            match = FRAME_RE.match(image.name)
+            if match is None or match["view"] != view:
+                continue
+            demo = f"{match['task']}__episode_{int(match['episode']):06d}"
+            self.frames.setdefault(demo, []).append((int(match["frame"]), image))
+        if not self.frames:
+            raise ValueError(f"no *__{view}__frame_*.png files in {self.path}")
+        for items in self.frames.values():
+            items.sort()
+        self.demos = sorted(self.frames, key=_demo_sort_key)
         self.reference_note = None
 
     def resolve_demo(self, requested):
-        candidates = [requested]
-        if requested.isdigit():
-            candidates.insert(0, f"demo_{int(requested)}")
-            candidates.append(self.demos[0])  # inference episodes have one demo, "episode"
-        for candidate in candidates:
-            if candidate in self.demos:
-                return candidate
-        raise ValueError(f"unknown demo {requested!r}; choices: {', '.join(self.demos)}")
+        if requested in self.frames:
+            return requested
+        raise ValueError(
+            f"unknown demo {requested!r}; e.g. {self.demos[0]} ... {self.demos[-1]} "
+            f"({len(self.demos)} total)")
 
     def frame_count(self, demo):
-        return int(self.groups[demo][self.paths[demo]].shape[0])
+        return len(self.frames[demo])
+
+    def demo_number(self, demo):
+        """1-based position of the demo within its task."""
+        task = demo.rsplit("__episode_", 1)[0]
+        return [d for d in self.demos if d.startswith(f"{task}__episode_")].index(demo) + 1
 
     def task(self, demo):
-        value = self.groups[demo].attrs.get("task_description", "")
-        return value.decode() if isinstance(value, bytes) else str(value)
+        return demo.rsplit("__episode_", 1)[0].replace("_", " ")
 
     def load(self, demo, frame_index):
         count = self.frame_count(demo)
         if not 0 <= frame_index < count:
             raise IndexError(f"frame {frame_index} is outside [0, {count - 1}] for {demo}")
-        with self.lock:
-            value = np.asarray(self.groups[demo][self.paths[demo]][frame_index])
-        bgr = cv2.imdecode(value.astype(np.uint8, copy=False), cv2.IMREAD_COLOR)
+        image_path = self.frames[demo][frame_index][1]
+        bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if bgr is None:
-            raise ValueError(f"could not decode {demo}/{self.paths[demo]}[{frame_index}]")
+            raise ValueError(f"could not decode {image_path}")
         image, self.reference_note = _to_model_view("reference", bgr, self.transform)
         return image
 
     def close(self):
-        self.file.close()
+        pass
 
 
-class ReferenceFiles:
-    """Reference recordings offered in the UI: the *.hdf5 files under --root,
-    labelled by model. Only these can be opened from the browser."""
+# Reference-image datasets per view, rollout/inference layout first, then collected demos.
+HDF5_VIEW_KEYS = {
+    "exo": ("primary_images_jpeg", "obs/agentview_rgb_jpeg"),
+    "wrist": ("wrist_images_jpeg", "obs/eye_in_hand_rgb_jpeg"),
+    "ego": ("ego_images_jpeg", "obs/ego_rgb_jpeg"),
+}
 
-    def __init__(self, root):
-        self.root = Path(root).expanduser().resolve()
 
-    def recordings(self):
-        if not self.root.is_dir():
-            return []
-        paths = sorted(self.root.rglob("*.hdf5"), key=lambda p: p.stat().st_mtime, reverse=True)
-        return [{"path": str(p), "name": str(p.relative_to(self.root)),
-                 "model": _model_label(p), "size_bytes": p.stat().st_size} for p in paths]
+class HDF5FrameStore:
+    """Reference frames read straight from a rollout / demo HDF5 (--hdf5).
 
-    def check(self, path):
-        path = Path(path).expanduser().resolve()
-        if path.suffix != ".hdf5" or not path.is_file() or not path.is_relative_to(self.root):
-            raise ValueError(f"not a recording under {self.root}: {path.name}")
-        return path
+    Every trial (data/trial_N, or data/demo_N for collected demos) becomes one
+    demo named <file-stem>__episode_<N>, so the UI works as with PNG frames. The
+    stored JPEGs are already the 480x480 model view. Frame 0 is the scene as the
+    trial started, which is what you match when staging the same positions."""
+
+    def __init__(self, hdf5_path, view, transform):
+        import h5py
+        self._h5py = h5py
+        self.path = Path(hdf5_path).expanduser().resolve()
+        if not self.path.is_file():
+            raise FileNotFoundError(f"HDF5 does not exist: {self.path}")
+        if view not in HDF5_VIEW_KEYS:
+            raise ValueError(f"no {view!r} view in HDF5 references")
+        self.view = view
+        self.transform = transform
+        self.stem = re.sub(r"[^A-Za-z0-9]+", "_", self.path.stem).strip("_")
+        self.groups = {}   # demo name -> (group path inside file, dataset key)
+        self._counts = {}
+        with h5py.File(self.path, "r", locking=False) as f:
+            data = f.get("data")
+            groups = ({k: v for k, v in data.items() if isinstance(v, h5py.Group)}
+                      if isinstance(data, h5py.Group) else {"episode": f})
+            for name, group in groups.items():
+                key = next((k for k in HDF5_VIEW_KEYS[view]
+                            if isinstance(group.get(k), h5py.Dataset)), None)
+                if key is None or group[key].shape[0] == 0:
+                    continue
+                digits = re.search(r"(\d+)$", name)
+                number = int(digits.group(1)) if digits else 0
+                demo = f"{self.stem}__episode_{number:06d}"
+                self.groups[demo] = (group.name, key)
+                self._counts[demo] = int(group[key].shape[0])
+        if not self.groups:
+            raise ValueError(f"no {view} images (tried {HDF5_VIEW_KEYS[view]}) in {self.path}")
+        self.demos = sorted(self.groups, key=_demo_sort_key)
+        self.reference_note = None
+
+    def resolve_demo(self, requested):
+        if requested in self.groups:
+            return requested
+        raise ValueError(
+            f"unknown trial {requested!r}; e.g. {self.demos[0]} ... {self.demos[-1]} "
+            f"({len(self.demos)} total)")
+
+    def frame_count(self, demo):
+        return self._counts[demo]
+
+    def demo_number(self, demo):
+        """Trial number (the N in trial_N)."""
+        return int(demo.rsplit("__episode_", 1)[1])
+
+    def task(self, demo):
+        return self.stem.replace("_", " ")
+
+    def load(self, demo, frame_index):
+        count = self.frame_count(demo)
+        if not 0 <= frame_index < count:
+            raise IndexError(f"frame {frame_index} is outside [0, {count - 1}] for {demo}")
+        group_path, key = self.groups[demo]
+        with self._h5py.File(self.path, "r", locking=False) as f:
+            row = np.asarray(f[group_path][key][frame_index], dtype=np.uint8)
+        bgr = cv2.imdecode(row, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError(f"could not decode frame {frame_index} of {demo} in {self.path}")
+        image, self.reference_note = _to_model_view("reference", bgr, self.transform)
+        return image
+
+    def close(self):
+        pass
 
 
 class OverlayState:
     MODES = ("blend", "outline", "side-by-side")
 
-    def __init__(self, store, camera, demo, frame_index, alpha, stale_s, min_edge_px,
-                 transform):
+    def __init__(self, store, camera, demo, frame_index, alpha, stale_s, min_edge_px):
         self.store = store
         self.camera = camera
         self.stale_s = stale_s
         self.min_edge_px = min_edge_px
-        self.transform = transform
         self.lock = threading.Lock()
         self.live_frame = None
         self.live_time = 0.0
         self.live_error = None
         self.alpha = float(np.clip(alpha, 0.0, 1.0))
         self.mode = "blend"
-        self.demo = None
-        self.frame_index = 0
-        self.reference = None
-        self.reference_edges = None
-        if store is not None:
-            self.demo = store.resolve_demo(demo)
-            self.frame_index = frame_index
-            self.reference = store.load(self.demo, self.frame_index)
-            self.reference_edges = _reference_edges(self.reference, min_edge_px)
-
-    def open_file(self, path):
-        """Switch the reference recording; the first demo's frame 0 is shown."""
-        store = DemoStore(path, self.camera, self.transform)
-        try:
-            demo = store.demos[0]
-            reference = store.load(demo, 0)
-            edges = _reference_edges(reference, self.min_edge_px)
-        except Exception:
-            store.close()
-            raise
-        with self.lock:
-            previous = self.store
-            self.store, self.demo, self.frame_index = store, demo, 0
-            self.reference, self.reference_edges = reference, edges
-        if previous is not None:
-            previous.close()
+        self.demo = store.resolve_demo(demo)
+        self.frame_index = frame_index
+        self.reference = store.load(self.demo, self.frame_index)
+        self.reference_edges = _reference_edges(self.reference, min_edge_px)
 
     def set_live(self, frame):
         """Accept a decoded BGR frame already in the 480x480 model view."""
@@ -253,14 +306,6 @@ class OverlayState:
 
     def configure(self, demo=None, frame_index=None, alpha=None, mode=None):
         with self.lock:
-            if self.store is None:
-                if mode is not None and mode not in self.MODES:
-                    raise ValueError(f"mode must be one of {self.MODES}")
-                if alpha is not None:
-                    self.alpha = float(np.clip(alpha, 0.0, 1.0))
-                if mode is not None:
-                    self.mode = mode
-                return
             next_demo = self.demo if demo is None else self.store.resolve_demo(demo)
             next_frame = self.frame_index if frame_index is None else int(frame_index)
             if next_demo != self.demo and frame_index is None:
@@ -298,21 +343,22 @@ class OverlayState:
                 live = "live"
             store = self.store
             return {
-                "hdf5": None if store is None else str(store.path),
-                "image_key": None if store is None else store.paths[self.demo],
+                "frames_dir": str(store.path),
+                "view": store.view,
                 "camera": self.camera,
-                "demos": [] if store is None else store.demos,
+                "demos": store.demos,
                 "demo": self.demo,
-                "task": "" if store is None else store.task(self.demo),
+                "task": store.task(self.demo),
+                "demo_number": store.demo_number(self.demo),
                 "frame": self.frame_index,
-                "frame_count": 0 if store is None else store.frame_count(self.demo),
+                "frame_count": store.frame_count(self.demo),
                 "alpha": self.alpha,
                 "mode": self.mode,
                 "modes": self.MODES,
                 "live": live,
                 "live_age_s": age,
                 "live_error": self.live_error,
-                "reference_note": None if store is None else store.reference_note,
+                "reference_note": store.reference_note,
             }
 
     def render(self):
@@ -333,15 +379,7 @@ class OverlayState:
             cv2.putText(live, "Waiting for live camera...", (30, live.shape[0] // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
 
-        if reference is None:
-            # No reference chosen yet: show the live view alone.
-            output = live
-            if mode == "side-by-side":
-                reference = blank.copy()
-                cv2.putText(reference, "Choose a reference file", (40, reference.shape[0] // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
-                output = np.concatenate((reference, live), axis=1)
-        elif mode == "blend":
+        if mode == "blend":
             output = cv2.addWeighted(live, 1.0 - alpha, reference, alpha, 0.0)
         elif mode == "outline":
             output = live
@@ -358,7 +396,7 @@ class OverlayState:
             live_text = f"STALE {live_age:.1f}s"
         else:
             live_text = f"live {live_age:.2f}s"
-        reference_text = "no reference" if demo is None else f"{demo} f{frame_index}"
+        reference_text = f"{self.store.task(demo)} #{self.store.demo_number(demo)} f{frame_index}"
         label = f"{self.camera} {reference_text} {mode} a{alpha:.2f} {live_text}"
         cv2.rectangle(output, (0, 0), (output.shape[1], 38), (0, 0, 0), -1)
         stale = live_age is not None and live_age > self.stale_s
@@ -367,60 +405,162 @@ class OverlayState:
         return output
 
 
-class CameraReader:
-    """Latest-frame V4L2 camera reader.
+class OpenTeachSubscriber:
+    """Latest-frame Open-Teach camera subscriber that survives camera restarts.
 
-    Reads the camera directly with the data scripts' crop. Bad reads are
-    reported in the UI and retried; nothing here commands the robot.
+    Unlike deploy_policy.OpenTeachCameraStream, bad packets are reported in the
+    UI and skipped instead of latching a SafetyViolation: nothing here commands
+    the robot.
     """
 
-    def __init__(self, name, device, transform, state, max_fps):
+    def __init__(self, name, host, port, transform, state, max_fps):
+        import zmq
+
+        self.zmq = zmq
         self.name = name
-        self.device = device
+        self.expected_serial = CAMERAS[name]["serial"]
+        self.endpoint = f"tcp://{host}:{port}"
         self.transform = transform
         self.state = state
         self.min_interval_s = 1.0 / max_fps
-        self.cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-        if not self.cap.isOpened():
-            raise RuntimeError(
-                f"could not open /dev/video{device} for {name}; is another process "
-                "(data collection, inference, robot_camera.py) using it?")
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_FRAME_SIZE[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_FRAME_SIZE[1])
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
-            target=self._read_loop, name=f"overlay-camera-{device}", daemon=True)
+            target=self._receive_loop, name=f"overlay-camera-{port}", daemon=True)
         self._thread.start()
 
-    def _read_loop(self):
-        last = 0.0
-        while not self._stop_event.is_set():
-            # grab() every pass drains V4L2's buffer (it ignores BUFFERSIZE=1);
-            # only decode and transform at the display rate.
-            if not self.cap.grab():
-                self.state.set_live_error(f"{self.name}: camera read failed")
-                self._stop_event.wait(0.2)
-                continue
-            now = time.monotonic()
-            if now - last < self.min_interval_s:
-                continue
-            last = now
-            try:
-                ok, bgr = self.cap.retrieve()
-                if not ok:
-                    raise ValueError("camera read failed")
-                frame, note = _to_model_view(self.name, bgr, self.transform)
-                if note is not None:
-                    raise ValueError(note)
-                self.state.set_live(frame)
-            except Exception as exc:
-                self.state.set_live_error(f"{self.name}: {exc}")
+    def _handle(self, raw):
+        if not raw.startswith(TOPIC):
+            raise ValueError("unexpected topic")
+        packet = pickle.loads(raw[len(TOPIC):])
+        serial = str(packet["camera_serial"])
+        if serial != self.expected_serial:
+            raise ValueError(
+                f"serial {serial} on {self.endpoint}, expected {self.expected_serial}")
+        jpeg = base64.b64decode(packet["rgb_image"])
+        bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("JPEG decode failed")
+        frame, note = _to_model_view(self.name, bgr, self.transform)
+        if note is not None:
+            raise ValueError(note)
+        self.state.set_live(frame)
+
+    def _receive_loop(self):
+        context = self.zmq.Context()
+        stream = context.socket(self.zmq.SUB)
+        stream.setsockopt(self.zmq.LINGER, 0)
+        stream.setsockopt(self.zmq.CONFLATE, 1)
+        stream.setsockopt(self.zmq.SUBSCRIBE, b"rgb_image")
+        stream.connect(self.endpoint)
+        try:
+            while not self._stop_event.is_set():
+                if not stream.poll(100, self.zmq.POLLIN):
+                    continue
+                try:
+                    self._handle(stream.recv())
+                except Exception as exc:
+                    self.state.set_live_error(f"{self.name}: {exc}")
+                # CONFLATE keeps only the newest frame, so decoding at the
+                # display rate instead of the camera's 30 Hz loses nothing and
+                # keeps CPU free for a concurrently running deploy_policy.py.
+                self._stop_event.wait(self.min_interval_s)
+        finally:
+            stream.close(linger=0)
+            context.term()
 
     def close(self):
         self._stop_event.set()
         self._thread.join(timeout=1.0)
-        self.cap.release()
+
+
+class FileSubscriber:
+    """Reads the 480x480 model-view JPEG the inference client publishes, so the overlay
+    never opens the camera device itself and can run alongside live inference."""
+
+    def __init__(self, name, view, live_dir, state, max_fps):
+        self.name = name
+        self.path = Path(live_dir) / f"{view}.jpg"
+        self.state = state
+        self.min_interval_s = 1.0 / max_fps
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name=f"overlay-{name}", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        last_mtime = None
+        while not self._stop_event.is_set():
+            try:
+                mtime = self.path.stat().st_mtime_ns
+                if mtime != last_mtime:
+                    bgr = cv2.imread(str(self.path), cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        raise ValueError("JPEG decode failed")
+                    if bgr.shape[:2] != (CAMERA_TARGET_SIZE, CAMERA_TARGET_SIZE):
+                        raise ValueError(f"expected 480x480, got {bgr.shape[1]}x{bgr.shape[0]}")
+                    last_mtime = mtime
+                    self.state.set_live(bgr)
+            except FileNotFoundError:
+                self.state.set_live_error(
+                    f"{self.name}: no frames at {self.path}; start the inference client "
+                    "(it publishes them) or run this overlay with --direct")
+            except Exception as exc:
+                self.state.set_live_error(f"{self.name}: {exc}")
+            self._stop_event.wait(self.min_interval_s)
+
+    def close(self):
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
+
+
+class V4L2Subscriber:
+    """Reads a local /dev/video camera, applies the xArm collection crop, and feeds
+    OverlayState with 480x480 BGR frames (same JPEG round trip as deploy)."""
+
+    def __init__(self, name, spec, state, max_fps):
+        self.name = name
+        self.spec = spec
+        self.state = state
+        self.min_interval_s = 1.0 / max_fps
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name=f"overlay-{name}", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        cap = cv2.VideoCapture(self.spec["video_id"], cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.spec["capture"][0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.spec["capture"][1])
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        w, h, x, y = self.spec["crop"]
+        try:
+            if not cap.isOpened():
+                self.state.set_live_error(f"{self.name}: cannot open /dev/video{self.spec['video_id']}")
+            while not self._stop_event.is_set():
+                if not cap.isOpened():
+                    self._stop_event.wait(1.0)
+                    cap.open(self.spec["video_id"], cv2.CAP_V4L2)
+                    continue
+                ok, bgr = cap.read()
+                if not ok:
+                    self.state.set_live_error(f"{self.name}: camera read failed")
+                    self._stop_event.wait(0.5)
+                    continue
+                try:
+                    cropped = bgr[y:y + h, x:x + w]
+                    if cropped.shape[:2] != (h, w):
+                        raise ValueError(f"crop produced {cropped.shape[:2]}, camera frame is {bgr.shape[:2]}")
+                    resized = cv2.resize(cropped, (CAMERA_TARGET_SIZE, CAMERA_TARGET_SIZE),
+                                         interpolation=cv2.INTER_LINEAR)
+                    ok, enc = cv2.imencode(".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), CAMERA_JPEG_QUALITY])
+                    self.state.set_live(cv2.imdecode(enc, cv2.IMREAD_COLOR))
+                except Exception as exc:
+                    self.state.set_live_error(f"{self.name}: {exc}")
+                self._stop_event.wait(self.min_interval_s)
+        finally:
+            cap.release()
+
+    def close(self):
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -434,106 +574,61 @@ button{background:#333;color:#eee;border:1px solid #555;border-radius:6px;paddin
 img{display:block;max-width:100%;margin-top:4px;border-radius:8px;background:#000}
 #status{color:#aaa;margin-top:9px;word-break:break-all}.bad{color:#f66}.wide{width:260px}
 #msg{min-height:18px;margin-top:6px}
-</style></head><body><main><h2>xArm7 demonstration overlay</h2>
+</style></head><body><main><h2>First-frame overlay</h2>
 <div class="controls">
-<label>Model <select id="model"></select></label>
-<label class="grow">File <select id="file"></select></label>
-</div>
-<div class="controls">
-<label id="taskLabel" hidden>Task <select id="task"></select></label>
-<label id="demoLabel">Demo <select id="demo"></select></label>
+<label>Task <select id="task"></select></label>
+<label>Demo <select id="demo"></select></label>
 <label>Frame <input id="frame" type="range" min="0" value="0" class="wide"><span id="frameValue"></span></label>
 <label>Opacity <input id="alpha" type="range" min="0" max="1" step="0.05" value="0.45"><span id="alphaValue"></span></label>
 <label>Mode <select id="mode"></select></label>
 </div><img id="stream" src="stream.mjpg"><div id="status"></div><div id="msg"></div>
 <script>
-const ids=n=>document.getElementById(n); let busy=false, taskTrials=null, lastHdf5, files=[], model='';
-// File name only, without .hdf5; long names keep their start and distinguishing end.
-const shortName=(p,n=44)=>{const b=p.split('/').pop().replace(/\.hdf5$/,'');return b.length>n?b.slice(0,n-17)+'…'+b.slice(-16):b;};
-const fmtB=b=>b>1e9?(b/1e9).toFixed(2)+' GB':(b/1e6).toFixed(0)+' MB';
+const ids=n=>document.getElementById(n); let busy=false, taskDemos=null, lastDir;
 const msg=(text,bad)=>{ids('msg').textContent=text||'';ids('msg').className=bad?'bad':'';};
 
-/* reference file: model + file dropdowns */
-async function loadFiles(){
- files=(await (await fetch('api/files')).json()).files||[];
- const counts={}; files.forEach(f=>counts[f.model]=(counts[f.model]||0)+1);
- const models=Object.keys(counts).sort((a,b)=>(a.startsWith('ICL')-b.startsWith('ICL'))||a.localeCompare(b));
- const m=ids('model'); m.replaceChildren(new Option(`All models (${files.length})`,''));
- models.forEach(x=>m.add(new Option(`${x} (${counts[x]})`,x))); m.value=model; fillFiles();
-}
-function fillFiles(current){
- const sel=ids('file'), shown=files.filter(f=>!model||f.model===model);
- sel.replaceChildren(new Option(`— choose a reference file (${shown.length}) —`,''));
- shown.forEach(f=>{const o=new Option(`${shortName(f.name)} — ${model?'':f.model+' · '}${fmtB(f.size_bytes)}`,f.path);o.title=f.name;sel.add(o);});
- const cur=current!==undefined?current:lastHdf5;
- if(cur&&!shown.some(f=>f.path===cur)){
-  // An open file outside the model filter: switch the filter to its model,
-  // or to all models for a --hdf5 file outside --root.
-  const known=files.find(f=>f.path===cur); const next=known?known.model:'';
-  if(next!==model){model=next;ids('model').value=model;return fillFiles(cur);}
-  const o=new Option(shortName(cur),cur); o.title=cur.split('/').pop(); sel.add(o);
- }
- sel.value=cur||''; sel.title=cur?cur.split('/').pop():'';
-}
-ids('model').onchange=e=>{model=e.target.value;fillFiles();};
-ids('file').onchange=e=>{if(e.target.value)openFile(e.target.value);};
-async function openFile(path){
- msg('Opening…');
- const r=await fetch('api/open?'+new URLSearchParams({path})); const s=await r.json();
- if(!r.ok){msg(s.error,true);fillFiles();return;}
- msg(''); await loadStatus(); fillFiles(s.hdf5);
-}
-
-/* demo / frame / opacity / mode */
-function showTrials(task, selected){
+/* demos are named <task>__episode_<N>; the Demo dropdown shows the 1-based position within the task */
+function showDemos(task, selected){
  const demo=ids('demo'); demo.replaceChildren();
- taskTrials[task].forEach(d=>demo.add(new Option(d.match(/_trial_(\d+)$/)[1],d)));
- demo.value=selected && taskTrials[task].includes(selected) ? selected : taskTrials[task][0];
+ taskDemos[task].forEach((d,i)=>demo.add(new Option(String(i+1),d)));
+ demo.value=selected && taskDemos[task].includes(selected) ? selected : taskDemos[task][0];
 }
 function rebuildDemos(s){
- ids('demo').replaceChildren(); ids('task').replaceChildren(); taskTrials=null;
- ids('taskLabel').hidden=true; ids('demoLabel').firstChild.textContent='Demo ';
- const matches=s.demos.map(d=>d.match(/^(.+)_trial_(\d+)$/));
- if(s.demos.length&&matches.every(Boolean)){
-  taskTrials={}; s.demos.forEach((d,i)=>(taskTrials[matches[i][1]]??=[]).push(d));
-  Object.keys(taskTrials).sort().forEach(t=>ids('task').add(new Option(t.replaceAll('_',' '),t)));
-  ids('taskLabel').hidden=false; ids('demoLabel').firstChild.textContent='Trial ';
- }else{s.demos.forEach(d=>ids('demo').add(new Option(d,d)));}
+ ids('demo').replaceChildren(); ids('task').replaceChildren(); taskDemos={};
+ s.demos.forEach(d=>(taskDemos[d.replace(/__episode_\d+$/,'')]??=[]).push(d));
+ Object.keys(taskDemos).sort().forEach(t=>ids('task').add(new Option(t.replaceAll('_',' '),t)));
 }
 async function loadStatus(){
  const s=await (await fetch('api/status')).json();
  if(!ids('mode').options.length)s.modes.forEach(m=>ids('mode').add(new Option(m,m)));
- if(s.hdf5!==lastHdf5){lastHdf5=s.hdf5; rebuildDemos(s); fillFiles(s.hdf5);}
- const has=!!s.hdf5; ['demo','task','frame'].forEach(n=>ids(n).disabled=!has);
- if(has){
-  if(taskTrials){const task=s.demo.match(/^(.+)_trial_(\d+)$/)[1]; if(ids('task').value!==task || !ids('demo').options.length){ids('task').value=task;showTrials(task,s.demo);}}
-  ids('demo').value=s.demo; ids('frame').max=s.frame_count-1; ids('frame').value=s.frame;
-  ids('frameValue').textContent=`${s.frame}/${s.frame_count-1}`;
- }else{ids('frameValue').textContent='';}
+ if(s.frames_dir!==lastDir){lastDir=s.frames_dir; rebuildDemos(s);}
+ const task=s.demo.replace(/__episode_\d+$/,'');
+ if(ids('task').value!==task || !ids('demo').options.length){ids('task').value=task;showDemos(task,s.demo);}
+ ids('demo').value=s.demo; ids('frame').max=s.frame_count-1; ids('frame').value=s.frame;
+ ids('frame').disabled=s.frame_count<2;
+ ids('frameValue').textContent=`${s.frame}/${s.frame_count-1}`;
  ids('alpha').value=s.alpha; ids('alphaValue').textContent=Number(s.alpha).toFixed(2); ids('mode').value=s.mode;
  const live={live:'LIVE',stale:`STALE (${Number(s.live_age_s).toFixed(1)}s)`,waiting:'WAITING FOR CAMERA'}[s.live];
  const st=ids('status'); st.replaceChildren();
  const line=(text,bad)=>{const d=document.createElement('div'); d.textContent=text; if(bad)d.className='bad'; st.append(d);};
- line(`${live} | ${s.camera} | ${has?(s.task ? s.task+' | ' : '')+s.hdf5.split('/').pop()+' : '+s.image_key:'no reference file: choose one above'}`, s.live!=='live'||!has);
+ line(`${live} | ${s.camera} (${s.view}) | ${s.task} | ${s.frames_dir}`, s.live!=='live');
  if(s.live_error) line(s.live_error, true);
  if(s.reference_note) line(s.reference_note, true);
 }
 async function update(params){if(busy)return;busy=true;try{await fetch('api/config?'+new URLSearchParams(params));await loadStatus();}finally{busy=false;}}
-ids('task').onchange=e=>{showTrials(e.target.value);update({demo:ids('demo').value});};
+ids('task').onchange=e=>{showDemos(e.target.value);update({demo:ids('demo').value});};
 ids('demo').onchange=e=>update({demo:e.target.value}); ids('frame').oninput=e=>{ids('frameValue').textContent=e.target.value}; ids('frame').onchange=e=>update({frame:e.target.value});
 ids('alpha').oninput=e=>{ids('alphaValue').textContent=Number(e.target.value).toFixed(2)}; ids('alpha').onchange=e=>update({alpha:e.target.value}); ids('mode').onchange=e=>update({mode:e.target.value});
-loadFiles().then(loadStatus); setInterval(loadStatus,1000); setInterval(loadFiles,15000);
+loadStatus(); setInterval(loadStatus,1000);
 </script></main></body></html>"""
 
 
 class OverlayHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, state, stream_fps, files):
+    def __init__(self, address, state, stream_fps):
         super().__init__(address, OverlayHandler)
         self.state = state
         self.stream_fps = stream_fps
-        self.files = files
 
 
 class OverlayHandler(BaseHTTPRequestHandler):
@@ -567,17 +662,6 @@ class OverlayHandler(BaseHTTPRequestHandler):
                     mode=values.get("mode", [None])[0],
                 )
                 self._send_json(self.server.state.status())
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-        elif request.path in ("/api/files", "/api/open"):
-            try:
-                values = {key: items[0] for key, items in parse_qs(request.query).items()}
-                files = self.server.files
-                if request.path == "/api/files":
-                    self._send_json({"root": str(files.root), "files": files.recordings()})
-                else:
-                    self.server.state.open_file(files.check(values["path"]))
-                    self._send_json(self.server.state.status())
             except Exception as exc:
                 self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         elif request.path == "/snapshot.jpg":
@@ -626,18 +710,33 @@ class OverlayHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--frames-dir", type=Path, default=DEFAULT_FRAMES,
+                        help="directory of first-frame PNGs")
+    parser.add_argument("--camera", choices=sorted(CAMERAS) + sorted(XARM_CAMERAS), default="cam0",
+                        help="cam0=ego (over-the-shoulder), cam1=wrist, cam2=exo (Open-Teach ZMQ); "
+                             "xarm_exo/xarm_wrist/xarm_ego read /dev/video18/4/10 directly "
+                             "(xArm7; use --frames-dir data/xarm7_first_frame_data/frames). "
+                             "Selects the reference view too")
+    parser.add_argument("--video-id", type=int, help="override /dev/video index for xarm_* cameras (--direct only)")
+    parser.add_argument("--direct", action="store_true",
+                        help="xarm_* cameras: open /dev/video directly instead of reading the frames the "
+                             "inference client publishes. Do NOT use while the client is running "
+                             "(a camera can only be opened once).")
+    parser.add_argument("--live-dir", type=Path, default=DEFAULT_LIVE_DIR,
+                        help="xarm_* cameras: directory the inference client publishes frames to")
     parser.add_argument("--hdf5", type=Path,
-                        help="initial reference recording (rollout or teleop HDF5); "
-                             "otherwise choose one in the browser")
-    parser.add_argument("--root", type=Path, default=ROOT / "data" / "rollouts" / "runs",
-                        help="recordings listed in the Model/File dropdowns")
-    parser.add_argument("--camera", choices=sorted(CAMERAS), default="exo",
-                        help="exo=overhead (/dev/video18), wrist=gripper (/dev/video4)")
-    parser.add_argument("--demo", default="0", help="demo number or group name (inference episodes: 'episode')")
+                        help="use frames from this rollout/demo HDF5 as the reference instead of "
+                             "--frames-dir PNGs; each trial (trial_N) is one demo, so --demo N "
+                             "picks trial N and --frame 0 is the scene at the start of the trial")
+    parser.add_argument("--task", help="initial task, e.g. clean_the_whiteboard (default: first)")
+    parser.add_argument("--demo", default="1",
+                        help="1-based demo number within --task, or a full group name "
+                             "like clean_the_whiteboard__episode_000100 (default: first)")
     parser.add_argument("--frame", type=int, default=0, help="reference frame within the demo")
     parser.add_argument("--alpha", type=float, default=0.45)
-    parser.add_argument("--camera-device", type=int,
-                        help="/dev/video index; default per --camera")
+    parser.add_argument("--camera-host", default="127.0.0.1")
+    parser.add_argument("--camera-port", type=int,
+                        help="Open-Teach camera port; default 10005+i for cam{i}")
     parser.add_argument("--stale-s", type=float, default=1.0,
                         help="mark the live feed stale after this many seconds")
     parser.add_argument("--min-edge-px", type=int, default=25,
@@ -650,35 +749,71 @@ def main():
     if args.stream_fps <= 0 or args.stale_s <= 0:
         parser.error("--stream-fps and --stale-s must be positive")
 
-    device = args.camera_device if args.camera_device is not None else CAMERAS[args.camera]["device"]
-    transform = _camera_transform(args.camera)
-    files = ReferenceFiles(args.root)
-    store = None if args.hdf5 is None else DemoStore(args.hdf5, args.camera, transform)
-    state = OverlayState(store, args.camera, args.demo, args.frame, args.alpha,
-                         args.stale_s, args.min_edge_px, transform)
-    subscriber = CameraReader(args.camera, device, transform, state, args.stream_fps)
-    server = OverlayHTTPServer(
-        (args.http_host, args.http_port), state, args.stream_fps, files)
+    is_xarm = args.camera in XARM_CAMERAS
+    camera = XARM_CAMERAS[args.camera] if is_xarm else CAMERAS[args.camera]
+    # xArm references are already the 480x480 post-crop view; the roi is only
+    # used for source-size matching, so a 480x480 "source" makes it a passthrough.
+    transform = ({"mode": "full_frame_resize", "source_width": 0, "source_height": 0}
+                 if is_xarm else camera["roi"])
+    if is_xarm and args.frames_dir == DEFAULT_FRAMES:
+        args.frames_dir = DEFAULT_XARM_FRAMES
+    if args.hdf5 is not None:
+        if not is_xarm:
+            parser.error("--hdf5 needs an xarm_* camera")
+        store = HDF5FrameStore(args.hdf5, camera["view"], transform)
+    else:
+        store = FrameStore(args.frames_dir, camera["view"], transform)
+    task = args.task or store.demos[0].rsplit("__episode_", 1)[0]
+    task_demos = [d for d in store.demos if d.startswith(f"{task}__episode_")]
+    if not task_demos:
+        parser.error(f"no demos for task {task!r}")
+    if args.demo.isdigit() and args.hdf5 is not None:
+        # trial number, e.g. --demo 4 = trial_4
+        matches = [d for d in task_demos if store.demo_number(d) == int(args.demo)]
+        if not matches:
+            parser.error(f"no trial {args.demo} in {args.hdf5}; have "
+                         f"{[store.demo_number(d) for d in task_demos]}")
+        demo = matches[0]
+    elif args.demo.isdigit():
+        if not 1 <= int(args.demo) <= len(task_demos):
+            parser.error(f"--demo must be in [1, {len(task_demos)}] for {task}")
+        demo = task_demos[int(args.demo) - 1]
+    else:
+        demo = args.demo
+    state = OverlayState(store, args.camera, demo, args.frame, args.alpha,
+                         args.stale_s, args.min_edge_px)
+    if is_xarm and not args.direct:
+        subscriber = FileSubscriber(args.camera, camera["view"], args.live_dir, state, args.stream_fps)
+    elif is_xarm:
+        spec = dict(camera)
+        if args.video_id is not None:
+            spec["video_id"] = args.video_id
+        subscriber = V4L2Subscriber(args.camera, spec, state, args.stream_fps)
+    else:
+        port = args.camera_port or camera["port"]
+        subscriber = OpenTeachSubscriber(
+            args.camera, args.camera_host, port, transform, state, args.stream_fps)
+    server = OverlayHTTPServer((args.http_host, args.http_port), state, args.stream_fps)
 
     def stop(_signum, _frame):
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    if store is None:
-        print("HDF5: none yet; choose a reference file in the browser")
+    print(f"Frames: {store.path} ({camera['view']} view)")
+    print(f"Demos: {store.demos[0]} ... {store.demos[-1]} ({len(store.demos)} total)")
+    if is_xarm and not args.direct:
+        print(f"Live: {args.camera} from {args.live_dir}/{camera['view']}.jpg (published by the inference client)")
+    elif is_xarm:
+        print(f"Live: {args.camera} DIRECT on /dev/video{spec['video_id']} crop {spec['crop']}")
     else:
-        print(f"HDF5: {store.path} ({store.image_key})")
-        print(f"Demos: {store.demos[0]} ... {store.demos[-1]} ({len(store.demos)} total)")
-    print(f"Live: {args.camera} on /dev/video{device}")
+        print(f"Live: {args.camera} serial {camera['serial']} on tcp://{args.camera_host}:{port}")
     print(f"Open http://{socket.gethostname()}:{args.http_port} in a browser")
     try:
         server.serve_forever()
     finally:
         server.server_close()
         subscriber.close()
-        if state.store is not None:
-            state.store.close()
 
 
 if __name__ == "__main__":
