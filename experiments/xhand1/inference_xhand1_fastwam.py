@@ -16,7 +16,9 @@ deploy_policy._run_hardware_loop with these differences:
   * actions are absolute targets by default; with --action-mode relative the
     server's delta dims are per-step increments accumulated from the state;
   * the model horizon (32 steps) is longer than a VPP chunk, so only the first
-    --execute-steps targets are executed before re-planning.
+    --execute-steps targets are executed before re-planning;
+  * checkpoints whose router reads past actions get the last K executed actions
+    (server /metadata action_history_steps), front-padded at the rollout start.
 
 Usage (shadow mode by default; Open-Teach provides the XHand driver and cameras):
   python experiments/xhand1/inference_xhand1_fastwam.py \
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 import json
 import os
 import time
@@ -83,6 +86,9 @@ class FastWAMClient:
         self.policy_hz = None
         self.substeps = None
         self.action_horizon = None
+        self.action_history_steps = 0
+        self.executed = deque()
+        self.last_active_future = None
 
     def check_contract(self, execution_hz: float, execute_steps: int) -> dict[str, object]:
         """Refuse to start unless the checkpoint matches what this client executes."""
@@ -106,6 +112,9 @@ class FastWAMClient:
         substeps = execution_hz / policy_hz if policy_hz > 0 else 0.0
         if substeps < 1 or abs(substeps - round(substeps)) > 1e-6:
             problems.append(f"policy_hz={policy_hz:g} does not divide the {execution_hz:g} Hz executor")
+        action_history_steps = int(meta.get("action_history_steps", 0))
+        if action_history_steps < 0:
+            problems.append(f"action_history_steps={action_history_steps} must be >= 0")
         if problems:
             raise RuntimeError("FastWAM server contract mismatch: " + "; ".join(problems))
         self.policy_hz = policy_hz
@@ -113,7 +122,15 @@ class FastWAMClient:
         self.action_horizon = int(meta["action_horizon"])
         self.relative_dims = np.asarray(relative_dims, dtype=bool)
         self.image_keys = image_keys
+        self.action_history_steps = action_history_steps
+        self.executed = deque(maxlen=action_history_steps)
         return meta
+
+    def record_executed(self, action: np.ndarray) -> None:
+        """One policy step whose commands were all sent: the server-returned row, as in
+        experiments/libero's ActionHistoryBuffer (the executed rows of each predicted chunk)."""
+        if self.action_history_steps:
+            self.executed.append(np.asarray(action, dtype=float).copy())
 
     def start_run(self, execute: bool) -> str:
         result = post_json(
@@ -140,6 +157,12 @@ class FastWAMClient:
             "demo_id": self.demo_id,
             "chunk_id": self.chunk_id,
         }
+        if self.action_history_steps:
+            # Fewer than K so far: front-pad like LeRobot at an episode start.
+            rows = [row.tolist() for row in self.executed]
+            n_pad = self.action_history_steps - len(rows)
+            payload["action_history"] = [[0.0] * ACTION_DIM] * n_pad + rows
+            payload["action_history_is_pad"] = [True] * n_pad + [False] * len(rows)
         started = time.perf_counter()
         result = post_json(self.server + "/infer", payload, self.timeout_s)
         if result.get("action_semantics") != self.action_mode:
@@ -151,8 +174,10 @@ class FastWAMClient:
         if actions.ndim != 2 or actions.shape[1] != ACTION_DIM or not np.isfinite(actions).all():
             raise RuntimeError(f"Policy returned invalid actions: {actions.shape}")
         server_ms = result.get("server_timing", {}).get("infer_ms", float("nan"))
+        self.last_active_future = result.get("active_future")
+        routed = f", future={self.last_active_future}" if self.last_active_future is not None else ""
         print(
-            f"[client] chunk {self.chunk_id}: {actions.shape[0]} targets, "
+            f"[client] chunk {self.chunk_id}: {actions.shape[0]} targets{routed}, "
             f"round trip {(time.perf_counter() - started) * 1000.0:.0f} ms (server {server_ms:.0f} ms)"
         )
         return actions
@@ -228,6 +253,7 @@ def annotate_recording(recorder, args: argparse.Namespace, client: FastWAMClient
     attrs["fastwam_server"] = client.server
     attrs["fastwam_run_id"] = client.run_id
     attrs["model_cameras"] = list(client.image_keys)
+    attrs["action_history_steps"] = client.action_history_steps
     attrs["model_action_horizon"] = client.action_horizon
     attrs["policy_hz"] = client.policy_hz
     attrs["chunk_size"] = args.execute_steps
@@ -325,6 +351,8 @@ def run_hardware_loop(args: argparse.Namespace, client: FastWAMClient, preopened
                     command_start = time.monotonic_ns()
                     result = executor.send(cmd)
                     command_end = time.monotonic_ns()
+                    if (command_index + 1) % client.substeps == 0:
+                        client.record_executed(predicted[command_index // client.substeps])
                     if recorder is not None:
                         recorder.update_latest_robot_sample(
                             state=result["measured_state"],
@@ -470,7 +498,8 @@ def main() -> None:
     print(
         f"[client] FastWAM server ready at {client.server}: cameras {client.image_keys}, horizon {client.action_horizon} @ "
         f"{client.policy_hz:g} Hz, executing {args.execute_steps} "
-        f"({args.execute_steps / client.policy_hz:.2f} s) per chunk at {client.policy_hz * client.substeps:g} Hz"
+        f"({args.execute_steps / client.policy_hz:.2f} s) per chunk at {client.policy_hz * client.substeps:g} Hz, "
+        f"action history {client.action_history_steps} steps"
     )
     client.start_run(execute=args.execution == "physical")
     preopened_hand = None

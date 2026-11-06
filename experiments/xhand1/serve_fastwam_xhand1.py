@@ -5,7 +5,9 @@ Adapted from experiments/r1lite/serve_fastwam_r1lite.py. The server owns
 FastWAM preprocessing, state normalization, inference, and action
 de-normalization. The robot client sends the measured 18-D state and the
 post-ROI 480x480 camera JPEGs keyed by the training camera names
-(data.train.shape_meta.images, e.g. ego and wrist).
+(data.train.shape_meta.images, e.g. ego and wrist; only the RGB group of a
+multimodal config). Checkpoints whose router reads past actions
+(router_action_history) also take the last K executed actions.
 Returned actions are ABSOLUTE targets, one per policy step (dataset fps /
 global_sample_stride):
     [x, y, z (m), rx, ry, rz (axis-angle rad), 12 XHand joint targets (rad)]
@@ -76,6 +78,10 @@ class InferenceRequest(BaseModel):
     run_id: Annotated[str, Field(pattern=RUN_ID_PATTERN)]
     demo_id: Annotated[str, Field(pattern=DEMO_ID_PATTERN)]
     chunk_id: Annotated[int, Field(ge=1)]
+    # router_action_history models: the last K executed actions (oldest first) in the
+    # returned action space, front-padded at a rollout start; is_pad marks the padding.
+    action_history: list[list[float]] | None = None
+    action_history_is_pad: list[bool] | None = None
 
 
 class StartRunRequest(BaseModel):
@@ -360,6 +366,16 @@ class FastWAMXHand1Policy:
 
         data_cfg = self.cfg.data.train
         image_meta = self.processor.shape_meta["images"]
+        groups = data_cfg.get("modality_camera_groups")
+        if groups is not None:
+            # Multimodal data: only the RGB cameras are observed. The model starts every
+            # future stream from the RGB first frame, which matches training only when the
+            # other streams are RGB-conditioned.
+            aux = {str(name) for name in groups} - {"rgb"}
+            unconditioned = aux - {str(m) for m in (data_cfg.get("rgb_condition_modalities") or ())}
+            if unconditioned:
+                raise ValueError(f"Streams {sorted(unconditioned)} are not in rgb_condition_modalities")
+            image_meta = [image_meta[int(i)] for i in groups["rgb"]]
         self.image_keys = [meta["key"] for meta in image_meta]
         self.image_shapes = {meta["key"]: tuple(meta["raw_shape"][1:]) for meta in image_meta}
         self.video_size = tuple(int(x) for x in data_cfg.video_size)
@@ -370,6 +386,16 @@ class FastWAMXHand1Policy:
             raise ValueError(f"Invalid concat_multi_camera: {self.concat_multi_camera}")
         # One action per `global_sample_stride` recorded frames.
         self.policy_hz = float(args.dataset_fps) / int(data_cfg.global_sample_stride)
+        if getattr(self.model, "router_history", False):
+            raise ValueError("router_history models need RGB observation history, which this server does not collect")
+        self.action_history_steps = (
+            int(self.model.router_action_history_steps) if getattr(self.model, "router_action_history", False) else 0
+        )
+        if self.action_history_steps != int(data_cfg.get("action_history_steps", 0)):
+            raise ValueError(
+                f"Model router_action_history_steps={self.action_history_steps} does not match "
+                f"data.train.action_history_steps={data_cfg.get('action_history_steps', 0)}"
+            )
 
         # Training configs do not necessarily define the optional uppercase
         # EVALUATION section used by some evaluation configs.
@@ -474,6 +500,26 @@ class FastWAMXHand1Policy:
         batch = self.processor.action_state_transform(batch)
         return self.processor.normalizer.forward(batch)["state"][key]
 
+    # Router action history: same as BaseLerobotDataset._process_action_history
+    def _action_history(self, request: InferenceRequest) -> dict[str, torch.Tensor]:
+        if not self.action_history_steps:
+            return {}
+        if request.action_history is None or request.action_history_is_pad is None:
+            raise ValueError("This checkpoint's router reads action_history; send action_history and action_history_is_pad")
+        action = torch.as_tensor(request.action_history, dtype=torch.float32)
+        is_pad = torch.as_tensor(request.action_history_is_pad, dtype=torch.bool)
+        if action.shape != (self.action_history_steps, ACTION_DIM) or is_pad.shape != (self.action_history_steps,):
+            raise ValueError(
+                f"action_history must be [{self.action_history_steps}, {ACTION_DIM}] with "
+                f"[{self.action_history_steps}] is_pad, got {tuple(action.shape)} and {tuple(is_pad.shape)}"
+            )
+        if not torch.isfinite(action[~is_pad]).all():
+            raise ValueError("action_history contains non-finite values")
+        key = self.processor.shape_meta["action"][0]["key"]
+        action = self.processor.normalizer.normalizers["action"][key].forward(action)
+        action = action.masked_fill(is_pad.unsqueeze(-1), 0.0)
+        return {"action_history": action, "action_history_is_pad": is_pad.float()}
+
     # Action denormalization
     def _denormalize_action(self, action: torch.Tensor) -> np.ndarray:
         if action.ndim == 2:
@@ -540,6 +586,7 @@ class FastWAMXHand1Policy:
             kwargs["num_video_frames"] = self.num_video_frames
         if self.active_future is not None and "active_future" in infer_params:
             kwargs["active_future"] = self.active_future
+        kwargs.update(self._action_history(request))
         # This is intentionally the final operation before infer_action: the
         # .pt contains the exact normalized tensors passed to the model.
         recorded_kwargs = dict(kwargs)
@@ -582,6 +629,7 @@ def build_app(policy: FastWAMXHand1Policy) -> FastAPI:
             "policy_hz": policy.policy_hz,
             "image_keys": policy.image_keys,
             "image_shapes": {key: list(shape) for key, shape in policy.image_shapes.items()},
+            "action_history_steps": policy.action_history_steps,
             "camera_layout": (
                 f"post-ROI inputs {policy.image_keys}; concat_multi_camera={policy.concat_multi_camera}; "
                 f"model image {height}x{width}"

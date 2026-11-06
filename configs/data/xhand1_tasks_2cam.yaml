@@ -5,7 +5,8 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - /home/wchi/Datasets/xhand_lerobot_fastwam/
+    # - /home/wchi/Datasets/xhand_lerobot_fastwam/
+    - /home/wchi/Datasets/xhand_lerobot_fastwam_150demo
   shape_meta:
     images:
       # LIBERO 2-cam layout: ego | wrist side by side, 224x224 each

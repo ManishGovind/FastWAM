@@ -33,7 +33,7 @@ resume: null
 
 # wandb
 wandb:
-  enabled: false
+  enabled: true
   workspace: null
   project: fast-wam
   name: train

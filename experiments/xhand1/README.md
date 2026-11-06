@@ -33,6 +33,14 @@ Action semantics follow r1lite: the server reports `EVALUATION.action_semantics`
 increments onto the measured state (rotation composed in the tool frame) and
 passes the other dims through as absolute targets.
 
+Multimodal router checkpoints (e.g. `xhand1_tasks_joint_2cam224_1e-4_router_full_all_streamemb_embed_tok_cf_ahist`)
+deploy with the same commands. The client still sends only the RGB cameras (the
+depth/flow futures start from the RGB frame, as in training), plus the last K
+executed actions when the router reads them (`/metadata` `action_history_steps`):
+one row per executed policy step, front-padded at the rollout start. The server
+normalizes them like training and refuses requests without them. Routers that
+read RGB observation history (`router_history`) are not supported.
+
 The client executes the first `--execute-steps` targets (default 8: 0.8 s at
 stride 3, like a VPP chunk; 0.27 s at stride 1), interpolated to the 30 Hz
 executor, then re-plans. It

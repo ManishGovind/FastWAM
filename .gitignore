@@ -285,3 +285,5 @@ MUJOCO_LOG.TXT
 !notebooks/router_analysis/outputs/
 notebooks/router_analysis/outputs/*
 !notebooks/router_analysis/outputs/full_all_attention_mask.html
+
+server_observations/

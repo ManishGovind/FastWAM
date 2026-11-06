@@ -14,9 +14,9 @@ data:
   train:
     action_history_steps: 32   # a_{t-32} .. a_{t-1} (action stride 1)
 
-batch_size: 16   # 3 video streams; libero_2cam_rgb_depth_flow runs 8 at the same 224x448
+batch_size: 8   # 3 video streams; libero_2cam_rgb_depth_flow runs 8 at the same 224x448
 num_workers: 8
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 
 model:
   mot_checkpoint_mixed_attn: false

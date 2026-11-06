@@ -7,7 +7,8 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_multimodal_video_dataset.RobotMultimodalVideoDataset
   dataset_dirs:
-    - /home/wchi/Datasets/xhand_lerobot_fastwam_150demo/
+    # - /home/wchi/Datasets/xhand_lerobot_fastwam_150demo/
+    - /data/mgovind/FastWAM/data/xhand_lerobot_fastwam_150demo
   shape_meta:
     images:
       # Order must match modality_camera_groups indices below.
