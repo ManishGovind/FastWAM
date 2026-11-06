@@ -43,6 +43,7 @@ for path in (PROJECT_ROOT, SRC_ROOT):
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from experiments.libero.eval_infer import ActionHistoryBuffer
 
 LOGGER = logging.getLogger("fastwam.r1lite.server")
 STATE_DIM = ACTION_DIM = 14
@@ -372,6 +373,14 @@ class FastWAMR1LitePolicy:
         self.embedding_model_tag = "".join(ch for ch in model_id.split("/")[-1].lower() if ch.isalnum()) or "textenc"
         self.num_video_frames = (int(self.cfg.data.train.num_frames) - 1) // int(self.cfg.data.train.action_video_freq_ratio) + 1
         self.lock = threading.Lock()
+        # router_action_history models: the last K executed actions (normalized) per episode, as in training.
+        # Executed = the first replan_steps rows of each returned chunk -> must equal the client's --replan-steps.
+        # No-op (empty kwargs) for every other model.
+        replan = int(args.replan_steps or self.action_horizon)
+        self.action_history = ActionHistoryBuffer(self.model, OmegaConf.create({"EVALUATION": {"replan_steps": replan}}))
+        self._history_episode: tuple[str, str] | None = None
+        if self.action_history.k:
+            LOGGER.info("Router action history: K=%d, %d executed actions per chunk", self.action_history.k, replan)
 
     # Validating shape of states and actions
     def _validate_contract(self) -> None:
@@ -466,6 +475,11 @@ class FastWAMR1LitePolicy:
             kwargs["num_video_frames"] = self.num_video_frames
         if self.active_future is not None and "active_future" in infer_params:
             kwargs["active_future"] = self.active_future
+        episode = (request.run_id, request.demo_id)
+        if episode != self._history_episode or request.chunk_id == 1:  # new episode -> empty (all-pad) history
+            self.action_history.rows.clear()
+            self._history_episode = episode
+        kwargs.update(self.action_history.kwargs())  # action_history [K, A] + action_history_is_pad [K]
         # This is intentionally the final operation before infer_action: the
         # .pt contains the exact normalized tensors passed to the model.
         recorded_kwargs = dict(kwargs)
@@ -476,6 +490,7 @@ class FastWAMR1LitePolicy:
         with self.lock, torch.no_grad():
             out = self.model.infer_action(**kwargs)
             self.last_active_future = out.get("active_future")  # stream the action read (None for RGB-only models)
+            self.action_history.push(out["action"])  # normalized; keeps the first replan_steps rows
         action = out["action"]
         if self.last_active_future is not None:
             LOGGER.info("active_future=%s", self.last_active_future)
@@ -557,6 +572,13 @@ def parse_args() -> argparse.Namespace:
         "--active-future",
         help="Multimodal select models: router (default) | random | rgb | depth | flow; "
         "default: EVALUATION.active_future of the config",
+    )
+    parser.add_argument(
+        "--replan-steps",
+        type=int,
+        default=None,
+        help="Actions the client executes per chunk (must equal the client's --replan-steps); "
+        "used for the router action history. Default: the full action horizon (client default)",
     )
     parser.add_argument("--tiled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--override", action="append", default=[], help="Repeat for each Hydra override")
