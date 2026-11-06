@@ -1,0 +1,340 @@
+<title>Router Pick Distributions</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column. Summary table (train vs eval) first, then training curves as small
+   multiples, then suite / perturbation matrices, then a per-task drill-down. Same type and neutrals as
+   the SR-MoT attention-mask page; the three stream colours are the validated categorical slots 1-3. */
+:root {
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --fg: #1b2026;
+  --muted: #5b6570;
+  --line: #d9dee3;
+  --grid: #e9ecef;
+  --band: #eef1f4;
+  --hl: #eaf3f4;
+  --accent: #0f6e78;
+  --rgb: #2a78d6;
+  --depth: #eb6834;
+  --flow: #1baf7a;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161a; --surface: #1a1f25; --fg: #e4e8ec; --muted: #9aa5b0; --line: #2e353d;
+    --grid: #252c33; --band: #20262d; --hl: #1c2b2e; --accent: #3fb5c1;
+    --rgb: #3987e5; --depth: #d95926; --flow: #199e70; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12161a; --surface: #1a1f25; --fg: #e4e8ec; --muted: #9aa5b0; --line: #2e353d;
+  --grid: #252c33; --band: #20262d; --hl: #1c2b2e; --accent: #3fb5c1;
+  --rgb: #3987e5; --depth: #d95926; --flow: #199e70; color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 40px; }
+section { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: 0.005em; }
+h1 { font-size: clamp(1.7rem, 3.4vw, 2.3rem); line-height: 1.12; }
+h2 { font-size: 1.35rem; }
+h3 { font-size: 1.02rem; }
+p { margin: 0; max-width: 72ch; }
+.muted { color: var(--muted); }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+code, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+header { display: flex; flex-direction: column; gap: 10px; }
+.key { display: flex; flex-wrap: wrap; gap: 18px; font-size: 14px; }
+.key span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex: none; }
+.sw.rgb { background: var(--rgb); } .sw.depth { background: var(--depth); } .sw.flow { background: var(--flow); }
+
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+.finding { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.finding b { font-family: var(--font-display); font-weight: 600; font-size: 1.02rem; }
+.finding span { color: var(--muted); font-size: 14px; }
+
+.scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+th { font-family: var(--font-mono); font-size: 11.5px; font-weight: 500; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+td.num { font-family: var(--font-mono); font-size: 13px; text-align: right; white-space: nowrap; }
+th.num { text-align: right; }
+tr.main td { background: var(--hl); }
+.vname { font-weight: 600; white-space: nowrap; }
+.vdesc { color: var(--muted); font-size: 12.5px; max-width: 30ch; }
+.cell { display: flex; flex-direction: column; gap: 4px; min-width: 150px; }
+
+.bar { display: flex; gap: 2px; height: 14px; width: 100%; }
+.bar i { display: block; height: 100%; min-width: 0; }
+.bar i:first-child { border-radius: 4px 0 0 4px; }
+.bar i:last-child { border-radius: 0 4px 4px 0; }
+.bar i:only-child { border-radius: 4px; }
+.bar i.rgb { background: var(--rgb); } .bar i.depth { background: var(--depth); } .bar i.flow { background: var(--flow); }
+.nums { font-family: var(--font-mono); font-size: 12px; color: var(--muted); display: flex; gap: 10px; white-space: nowrap; }
+.nums span { display: inline-flex; align-items: center; gap: 4px; }
+.nums .sw { width: 8px; height: 8px; border-radius: 2px; }
+
+.multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 12px 12px 6px; display: flex; flex-direction: column; gap: 4px; min-width: 0; position: relative; }
+.panel.main { border-color: var(--accent); }
+.panel svg { width: 100%; height: auto; display: block; overflow: visible; }
+.panel .sub { font-size: 12.5px; color: var(--muted); }
+svg text { font-family: var(--font-mono); font-size: 10px; fill: var(--muted); }
+svg .gridl { stroke: var(--grid); stroke-width: 1; }
+svg .axis { stroke: var(--line); stroke-width: 1; }
+svg .warm { fill: var(--band); }
+svg .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg .ln.rgb { stroke: var(--rgb); } svg .ln.depth { stroke: var(--depth); } svg .ln.flow { stroke: var(--flow); }
+svg .cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+svg .dot { stroke: var(--surface); stroke-width: 2; }
+svg .dot.rgb { fill: var(--rgb); } svg .dot.depth { fill: var(--depth); } svg .dot.flow { fill: var(--flow); }
+
+.controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+select { font: inherit; font-size: 14px; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); }
+select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.suite-row td { background: var(--band); font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding-block: 6px; }
+.task { max-width: 46ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dom { font-family: var(--font-mono); font-size: 12px; }
+
+#tip { position: fixed; z-index: 20; pointer-events: none; background: var(--surface); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 10px; font-size: 12.5px; line-height: 1.45; box-shadow: 0 4px 14px rgb(0 0 0 / 0.12); min-width: 150px; }
+#tip .t { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); margin-bottom: 3px; }
+#tip .r { display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); }
+#tip .r b { font-weight: 500; margin-left: auto; padding-left: 12px; }
+.badge { display: inline-block; font-family: var(--font-mono); font-size: 11px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--line); margin-bottom: 4px; }
+.badge.measured { color: var(--fg); }
+.badge.assumed, .badge.not-measured { color: var(--muted); border-style: dashed; }
+ul.notes { margin: 0; padding-left: 1.2em; display: flex; flex-direction: column; gap: 6px; max-width: 80ch; }
+@media (prefers-reduced-motion: no-preference) { .bar i { transition: opacity 0.15s; } }
+.bar:hover i { opacity: 0.85; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">FastWAM · modality router · LIBERO</div>
+    <h1>Router pick distributions</h1>
+    <p class="muted">Which imagined future (RGB, depth or flow) each router variant sends the action to, during training and at evaluation. Six router variants, all trained on LIBERO for 21.7k steps.</p>
+    <div class="key" aria-label="Stream colours">
+      <span><i class="sw rgb"></i>RGB</span><span><i class="sw depth"></i>Depth</span><span><i class="sw flow"></i>Flow</span>
+    </div>
+  </header>
+
+  <section aria-labelledby="f-h">
+    <h2 id="f-h">At a glance</h2>
+    <div class="findings" id="findings"></div>
+  </section>
+
+  <section aria-labelledby="s-h">
+    <h2 id="s-h">Training vs. evaluation</h2>
+    <p class="muted">Training picks are <em>sampled</em> from the router (last 10% of training). Eval picks are the router's <em>argmax</em> at every replan. Numbers under each bar are RGB · depth · flow in %.</p>
+    <div class="scroll"><table id="summary"></table></div>
+  </section>
+
+  <section aria-labelledby="d-h">
+    <h2 id="d-h">Picked slot vs. decoded content</h2>
+    <p class="muted">The router picks a <em>slot</em> (named rgb, depth or flow). Without stream identity a slot's name does not fix what it generates, so the decoded content can differ from the pick. "Decoded" applies each slot's measured content to the eval picks. Numbers are RGB · depth · flow in %.</p>
+    <div class="scroll"><table id="decode"></table></div>
+  </section>
+
+  <section aria-labelledby="t-h">
+    <h2 id="t-h">Picks during training</h2>
+    <p class="muted">Share of each training batch routed to each stream (rank 0, 32 samples per logged step), rolling mean over 500 steps. Shaded: the 2k-step warm-up, where picks are uniform and the router is not trained. Hover a panel for exact values.</p>
+    <div class="multiples" id="curves"></div>
+  </section>
+
+  <section aria-labelledby="l-h">
+    <h2 id="l-h">LIBERO: picks by suite</h2>
+    <p class="muted">Eval picks per task suite (40 tasks, 50 episodes each). The small number is the suite's success rate.</p>
+    <div class="scroll"><table id="suites"></table></div>
+  </section>
+
+  <section aria-labelledby="p-h">
+    <h2 id="p-h">LIBERO-Plus: picks by perturbation</h2>
+    <p class="muted">Eval picks per perturbation category (1,495 tasks, at most 5 per base task). If the router reacted to the perturbation, the rows would change across categories.</p>
+    <div class="scroll"><table id="cats"></table></div>
+  </section>
+
+  <section aria-labelledby="k-h">
+    <h2 id="k-h">LIBERO: picks per task</h2>
+    <div class="controls">
+      <label for="variant">Variant</label>
+      <select id="variant"></select>
+      <span class="muted" id="variant-sum"></span>
+    </div>
+    <div class="scroll"><table id="tasks"></table></div>
+  </section>
+
+  <section aria-labelledby="n-h">
+    <h2 id="n-h">How this was computed</h2>
+    <ul class="notes muted">
+      <li>Training: <code>train/router_pick_{rgb,depth,flow}</code> from each run's local wandb file, logged every 10 steps by rank 0 as the fraction of that step's batch routed to each stream. Warm-up steps (≤ 2,000) are excluded from the summary.</li>
+      <li>Evaluation: every <code>Router selected active_future=…</code> line in the eval worker logs, assigned to the task running on that worker at that time. Each replan counts once. Tasks run with a fixed stream are excluded.</li>
+      <li>Decoded content: picks × each slot's measured content (rows = slot, columns = content). "Measured" = decoded futures were checked for that model; "assumed" = same stream embedding as a checked model, not decoded separately. For the full-layout router without identity the flow slot's split comes from 27 windows and varies with the task phase, so its decoded mix is approximate.</li>
+      <li>"One-stream tasks": tasks where one stream gets more than 90% of the replans.</li>
+      <li>Training samples from the router's distribution; evaluation takes the most likely stream. The two can differ even for the same model.</li>
+      <li>Built by <code>notebooks/router_analysis/scripts/build_router_picks_page.py</code>.</li>
+    </ul>
+  </section>
+</div>
+<div id="tip" hidden></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const S = ["rgb", "depth", "flow"], SL = { rgb: "RGB", depth: "Depth", flow: "Flow" };
+const MAIN = "streamemb_embed";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const f1 = (x) => (Math.round(x * 10) / 10).toFixed(1);
+
+/* 100% stacked bar + the numbers under it; hover shows a tooltip. */
+function bar(p, title) {
+  if (!p) return '<span class="muted">–</span>';
+  const segs = S.map((s, i) => p[i] > 0 ? `<i class="${s}" style="flex:${p[i]} 1 0"></i>` : "").join("");
+  const tip = esc(JSON.stringify({ t: title, p }));
+  const nums = S.map((s, i) => `<span><i class="sw ${s}"></i>${Math.round(p[i])}</span>`).join("");
+  return `<div class="cell"><div class="bar" data-tip="${tip}">${segs}</div><div class="nums">${nums}</div></div>`;
+}
+
+/* ---- at a glance ---- */
+(function findings() {
+  const tr = DATA.map((v) => v.train.final);
+  const lo = S.map((_, i) => Math.min(...tr.map((p) => p[i]))), hi = S.map((_, i) => Math.max(...tr.map((p) => p[i])));
+  const ev = DATA.map((v) => v.libero.all);
+  const elo = S.map((_, i) => Math.min(...ev.map((p) => p[i]))), ehi = S.map((_, i) => Math.max(...ev.map((p) => p[i])));
+  const m = DATA.find((v) => v.key === MAIN);
+  const plusSpread = Math.max(...DATA.map((v) => {
+    const g = v.plus.groups.map((x) => x.picks);
+    return Math.max(...S.map((_, i) => Math.max(...g.map((p) => p[i])) - Math.min(...g.map((p) => p[i]))));
+  }));
+  const items = [
+    ["Training mix is the same for every variant",
+     `Last 10% of training: RGB ${Math.round(lo[0])}–${Math.round(hi[0])}%, depth ${Math.round(lo[1])}–${Math.round(hi[1])}%, flow ${Math.round(lo[2])}–${Math.round(hi[2])}% across all six.`],
+    ["Evaluation picks spread out",
+     `LIBERO argmax picks range from RGB ${Math.round(elo[0])}–${Math.round(ehi[0])}% and flow ${Math.round(elo[2])}–${Math.round(ehi[2])}%. The transformer and query routers lean hard on flow.`],
+    ["No reaction to the perturbation",
+     `On LIBERO-Plus no variant's mix moves more than ${Math.round(plusSpread)} points between camera, background, noise and layout.`],
+    ["Main model",
+     `${m.label.replace(" (main)", "")}: ${m.libero.one_stream}/40 tasks use one stream, ${f1(m.libero.success)}% LIBERO, ${f1(m.plus.success)}% LIBERO-Plus.`],
+  ];
+  $("findings").innerHTML = items.map(([b, s]) => `<div class="finding"><b>${b}</b><span>${s}</span></div>`).join("");
+})();
+
+/* ---- summary table ---- */
+$("summary").innerHTML = `<thead><tr><th>Variant</th><th>Training (sampled)</th><th>LIBERO eval</th><th>LIBERO-Plus eval</th>
+  <th class="num">LIBERO %</th><th class="num">Plus %</th><th class="num">One-stream tasks</th></tr></thead><tbody>` +
+  DATA.map((v) => `<tr class="${v.key === MAIN ? "main" : ""}">
+    <td><div class="vname">${esc(v.label)}</div><div class="vdesc">${esc(v.desc)}</div></td>
+    <td>${bar(v.train.final, v.label + " · training, last 10%")}</td>
+    <td>${bar(v.libero.all, v.label + " · LIBERO eval")}</td>
+    <td>${bar(v.plus.all, v.label + " · LIBERO-Plus eval")}</td>
+    <td class="num">${f1(v.libero.success)}</td><td class="num">${f1(v.plus.success)}</td>
+    <td class="num">${v.libero.one_stream}/${v.libero.tasks}</td></tr>`).join("") + "</tbody>";
+
+/* ---- picked slot vs decoded content ---- */
+$("decode").innerHTML = `<thead><tr><th>Variant</th><th>LIBERO picks</th><th>LIBERO decoded</th><th>LIBERO-Plus picks</th>
+  <th>LIBERO-Plus decoded</th><th>Content</th></tr></thead><tbody>` +
+  DATA.map((v) => `<tr class="${v.key === MAIN ? "main" : ""}">
+    <td><div class="vname">${esc(v.label)}</div><div class="vdesc">${esc(v.desc)}</div></td>
+    <td>${bar(v.libero.all, v.label + " · LIBERO picks (slot)")}</td>
+    <td>${bar(v.decode.libero, v.label + " · LIBERO decoded content")}</td>
+    <td>${bar(v.plus.all, v.label + " · LIBERO-Plus picks (slot)")}</td>
+    <td>${bar(v.decode.plus, v.label + " · LIBERO-Plus decoded content")}</td>
+    <td><div class="badge ${v.decode.status.replace(" ", "-")}">${esc(v.decode.status)}</div><div class="vdesc">${esc(v.decode.source)}</div></td></tr>`).join("") + "</tbody>";
+
+/* ---- training curves (small multiples, shared scales) ---- */
+const W = 320, H = 170, ML = 30, MR = 8, MT = 8, MB = 22;
+const XMAX = Math.max(...DATA.map((v) => v.train.last_step));
+const xs = (s) => ML + (s / XMAX) * (W - ML - MR), ys = (p) => MT + (1 - p / 100) * (H - MT - MB);
+$("curves").innerHTML = DATA.map((v, k) => {
+  const c = v.train.curve;
+  const grid = [0, 25, 50, 75, 100].map((y) => `<line class="gridl" x1="${ML}" x2="${W - MR}" y1="${ys(y)}" y2="${ys(y)}"/><text x="${ML - 5}" y="${ys(y) + 3}" text-anchor="end">${y}</text>`).join("");
+  const xt = [0, 5000, 10000, 15000, 20000].map((x) => `<text x="${xs(x)}" y="${H - 6}" text-anchor="middle">${x / 1000}k</text>`).join("");
+  const warm = `<rect class="warm" x="${xs(0)}" y="${MT}" width="${xs(v.train.warmup) - xs(0)}" height="${H - MT - MB}"/>`;
+  const lines = S.map((s, i) => `<polyline class="ln ${s}" points="${c.map((r) => `${xs(r[0]).toFixed(1)},${ys(r[i + 1]).toFixed(1)}`).join(" ")}"/>`).join("");
+  return `<div class="panel ${v.key === MAIN ? "main" : ""}"><h3>${esc(v.label)}</h3>
+    <div class="sub">final ${S.map((s, i) => `${SL[s]} ${Math.round(v.train.final[i])}%`).join(" · ")}</div>
+    <svg viewBox="0 0 ${W} ${H}" data-k="${k}" role="img" aria-label="${esc(v.label)} training picks over steps">${warm}${grid}${xt}
+      <line class="axis" x1="${ML}" x2="${W - MR}" y1="${ys(0)}" y2="${ys(0)}"/>${lines}<g class="hover" hidden></g>
+      <rect x="${ML}" y="${MT}" width="${W - ML - MR}" height="${H - MT - MB}" fill="transparent"/></svg></div>`;
+}).join("");
+
+document.querySelectorAll("#curves svg").forEach((svg) => {
+  const v = DATA[+svg.dataset.k], c = v.train.curve, g = svg.querySelector(".hover");
+  const move = (e) => {
+    const pt = svg.getBoundingClientRect(), x = ((e.clientX - pt.left) / pt.width) * W;
+    const step = Math.max(0, Math.min(XMAX, ((x - ML) / (W - ML - MR)) * XMAX));
+    let j = 0; for (let i = 1; i < c.length; i++) if (Math.abs(c[i][0] - step) < Math.abs(c[j][0] - step)) j = i;
+    const r = c[j], X = xs(r[0]);
+    g.innerHTML = `<line class="cross" x1="${X}" x2="${X}" y1="${MT}" y2="${ys(0)}"/>` +
+      S.map((s, i) => `<circle class="dot ${s}" cx="${X}" cy="${ys(r[i + 1])}" r="4"/>`).join("");
+    g.hidden = false;
+    showTip(e, `${v.label} · step ${r[0].toLocaleString()}${r[0] <= v.train.warmup ? " (warm-up)" : ""}`, r.slice(1));
+  };
+  svg.addEventListener("pointermove", move);
+  svg.addEventListener("pointerleave", () => { g.hidden = true; hideTip(); });
+});
+
+/* ---- suite / category matrices ---- */
+function matrix(id, key, names) {
+  $(id).innerHTML = `<thead><tr><th>Variant</th>${names.map((n) => `<th>${esc(n)}</th>`).join("")}</tr></thead><tbody>` +
+    DATA.map((v) => {
+      const gs = Object.fromEntries(v[key].groups.map((g) => [g.name, g]));
+      return `<tr class="${v.key === MAIN ? "main" : ""}"><td class="vname">${esc(v.label)}</td>` + names.map((n) => {
+        const g = gs[n];
+        return `<td>${g ? bar(g.picks, `${v.label} · ${n}`) + `<div class="nums">success ${f1(g.success)}%</div>` : "–"}</td>`;
+      }).join("") + "</tr>";
+    }).join("") + "</tbody>";
+}
+matrix("suites", "libero", ["spatial", "object", "goal", "10"]);
+matrix("cats", "plus", ["Camera Viewpoints", "Background Textures", "Sensor Noise", "Objects Layout"]);
+document.querySelector("#suites thead").innerHTML = document.querySelector("#suites thead").innerHTML.replace(">10<", ">Long (10)<");
+
+/* ---- per-task drill-down ---- */
+const sel = $("variant");
+sel.innerHTML = DATA.map((v) => `<option value="${v.key}" ${v.key === MAIN ? "selected" : ""}>${esc(v.label)}</option>`).join("");
+function tasks() {
+  const v = DATA.find((x) => x.key === sel.value), t = v.libero.per_task || [];
+  $("variant-sum").textContent = `${v.libero.one_stream}/${v.libero.tasks} tasks use one stream · ${f1(v.libero.success)}% success`;
+  let html = `<thead><tr><th>Task</th><th>Picks</th><th class="num">Main stream</th><th class="num">Replans</th><th class="num">Success %</th></tr></thead><tbody>`;
+  let cur = "";
+  for (const r of t) {
+    if (r.suite !== cur) { cur = r.suite; html += `<tr class="suite-row"><td colspan="5">${cur === "10" ? "long (10)" : cur}</td></tr>`; }
+    const i = r.picks.indexOf(Math.max(...r.picks));
+    html += `<tr><td><div class="task" title="${esc(r.name)}">${esc(r.name)}</div></td><td>${bar(r.picks, r.name)}</td>
+      <td class="num dom">${SL[S[i]]} ${Math.round(r.picks[i])}%</td><td class="num">${r.n}</td><td class="num">${f1(r.success)}</td></tr>`;
+  }
+  $("tasks").innerHTML = html + "</tbody>";
+}
+sel.addEventListener("change", () => { tasks(); try { localStorage.setItem("router-picks-variant", sel.value); } catch (e) {} });
+try { const s = localStorage.getItem("router-picks-variant"); if (s && DATA.some((v) => v.key === s)) sel.value = s; } catch (e) {}
+tasks();
+
+/* ---- shared tooltip ---- */
+const tip = $("tip");
+function showTip(e, title, p) {
+  tip.innerHTML = `<div class="t">${esc(title)}</div>` + S.map((s, i) => `<div class="r"><i class="sw ${s}"></i>${SL[s]}<b>${f1(p[i])}%</b></div>`).join("");
+  tip.hidden = false;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + w > innerWidth - 8) x = e.clientX - w - 14;
+  if (y + h > innerHeight - 8) y = e.clientY - h - 14;
+  tip.style.left = Math.max(8, x) + "px"; tip.style.top = Math.max(8, y) + "px";
+}
+function hideTip() { tip.hidden = true; }
+document.addEventListener("pointerover", (e) => {
+  const b = e.target.closest && e.target.closest(".bar[data-tip]");
+  if (!b) return;
+  const d = JSON.parse(b.dataset.tip);
+  const mv = (ev) => showTip(ev, d.t, d.p);
+  mv(e);
+  b.addEventListener("pointermove", mv);
+  b.addEventListener("pointerleave", () => { b.removeEventListener("pointermove", mv); hideTip(); }, { once: true });
+});
+</script>

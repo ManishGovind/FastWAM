@@ -924,6 +924,11 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
+    # Eval-only inference layout for router models (e.g. short for a full/cf-trained router;
+    # full + chosen == short, test_infer_short_cf_ahist.py). null = as trained.
+    if cfg.EVALUATION.get("router_layout", None):
+        model.router_layout = str(cfg.EVALUATION.router_layout).lower()
+        logging.info("EVALUATION.router_layout -> %s", model.router_layout)
     validate_eval_infer_model(
         model,
         action_attend_mode=cfg.EVALUATION.get("action_attend_mode", None),

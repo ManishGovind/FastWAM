@@ -496,12 +496,8 @@ def _resolve_camera_streams(source_keys: list[str] | None) -> list[dict[str, str
         return [dict(s) for s in DEFAULT_CAMERA_STREAMS]
     streams = []
     for key in source_keys:
-        if key not in catalog:
-            raise ValueError(
-                f"Unknown source key '{key}'. Known: {sorted(catalog)}. "
-                "Add a mapping in DEFAULT_CAMERA_STREAMS if needed."
-            )
-        streams.append(dict(catalog[key]))
+        # Unknown keys (other robots, e.g. xhand ego/wrist/exo): <key>_depth / <key>_flow.
+        streams.append(dict(catalog.get(key) or {"source_key": key, "depth_key": f"{key}_depth", "flow_key": f"{key}_flow"}))
     return streams
 
 

@@ -42,6 +42,8 @@ EVALUATION:
 
   # FastWAMJointMultimodal infer ablation: all | rgb | depth | flow | rgb_depth | rgb_flow | depth_flow | cond_only
   action_attend_mode: all
+  # Router models: eval-only inference layout (short | full); null = as trained. full + chosen == short.
+  router_layout: null
 
   # Optional external inputs
   dataset_stats_path: null

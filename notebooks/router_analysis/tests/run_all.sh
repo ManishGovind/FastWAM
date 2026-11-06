@@ -29,11 +29,18 @@ run distill            python $T/test_distill.py   # real student + 3 teachers o
 run stream_embedding   python $T/test_stream_embedding.py   # real model on CPU, ~5 min
 run router_embed       python $T/test_router_embed.py       # real model on CPU, ~5 min
 run router_transformer python $T/test_router_transformer.py # real model on CPU, ~5 min
+run router_query       python $T/test_router_query.py       # real model on CPU, ~5 min
+run router_counterfactual python $T/test_router_counterfactual.py   # real model on CPU, ~10 min
 run robotwin_tile      python $T/test_multimodal_robotwin_tile.py   # R1-Lite data on CPU, ~1 min
 run image_history      python $T/test_image_history.py      # LIBERO data on CPU, ~2 min
 run router_history     python $T/test_router_history.py     # real model on CPU, ~10 min
+run router_action_history python $T/test_router_action_history.py   # LIBERO data + real model (REINFORCE + cf) on CPU, ~20 min
+run robotwin_action_history python $T/test_robotwin_action_history.py   # RoboTwin policy wiring (stub model) + RoboTwin data, CPU, ~2 min
 run history_invariance python $T/test_history_video_invariance.py   # real model on CPU, ~10 min
 run mm_stream_embedding python $T/test_mm_stream_embedding.py   # real MM model on CPU, ~8 min
+run mm_stream_embedding_token python $T/test_mm_stream_embedding_token.py   # real MM model on CPU, ~8 min
+run router_stream_embedding_token python $T/test_router_stream_embedding_token.py   # real router model on CPU, ~8 min
+run stream_embedding_token python $T/test_stream_embedding_token.py   # real router model on CPU, ~8 min
 # real model (5B; several minutes each on CPU)
 run test_prompt_target python $T/test_prompt_target.py
 run test_trainer_eval  python $T/test_trainer_eval.py

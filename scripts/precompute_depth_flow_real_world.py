@@ -78,11 +78,13 @@ DEFAULT_FB_ABS = 1.0  # fwd-bwd check: |f + b_warped| < fb_rel * (|f|^2 + |b_war
 DEFAULT_FB_REL = 0.05
 
 
-def duplicate_runs(frames_thwc_u8: np.ndarray, dup_thresh: float) -> tuple[np.ndarray, np.ndarray]:
+def duplicate_runs(
+    frames_thwc_u8: np.ndarray, dup_thresh: float, gap: int = 1
+) -> tuple[np.ndarray, np.ndarray]:
     """Return (run_start[t], next_distinct[t]) for every frame.
 
     run_start[t]: first frame of the duplicate run containing t.
-    next_distinct[t]: first frame of the following run, or -1 if t is in the last run.
+    next_distinct[t]: first frame of the run `gap` runs later (gap distinct frames ahead), or -1 if none.
     """
     t = frames_thwc_u8.shape[0]
     diff = np.array(
@@ -97,7 +99,7 @@ def duplicate_runs(frames_thwc_u8: np.ndarray, dup_thresh: float) -> tuple[np.nd
     run_id = np.cumsum(is_new) - 1
     run_start = starts[run_id]
     next_distinct = np.array(
-        [starts[r + 1] if r + 1 < len(starts) else -1 for r in run_id], dtype=np.int64
+        [starts[r + gap] if r + gap < len(starts) else -1 for r in run_id], dtype=np.int64
     )
     return run_start, next_distinct
 
@@ -124,8 +126,10 @@ class RealWorldRaftFlowEstimator(base.RaftFlowEstimator):
         fb_check: bool = True,
         fb_abs: float = DEFAULT_FB_ABS,
         fb_rel: float = DEFAULT_FB_REL,
+        flow_gap: int = 1,
     ):
         super().__init__(device=device, model_size=model_size)
+        self.flow_gap = int(flow_gap)
         self.dup_thresh = float(dup_thresh)
         self.fb_check = bool(fb_check)
         self.fb_abs = float(fb_abs)
@@ -147,13 +151,13 @@ class RealWorldRaftFlowEstimator(base.RaftFlowEstimator):
     def __call__(
         self, frames_thwc_u8: np.ndarray, batch_size: int = 4, deshake: bool = False
     ) -> np.ndarray:
-        """frames [T,H,W,3] -> flow [T,2,H,W]; flow[t] = t -> next distinct frame (0 in last run)."""
+        """frames [T,H,W,3] -> flow [T,2,H,W]; flow[t] = t -> flow_gap-th next distinct frame (0 at the end)."""
         t, h, w, _ = frames_thwc_u8.shape
         out = np.zeros((t, 2, h, w), dtype=np.float32)
         if t == 1:
             return out
 
-        run_start, next_distinct = duplicate_runs(frames_thwc_u8, self.dup_thresh)
+        run_start, next_distinct = duplicate_runs(frames_thwc_u8, self.dup_thresh, self.flow_gap)
         # One RAFT pair per duplicate run; frames in the same run share the result.
         pairs = sorted({(int(s), int(n)) for s, n in zip(run_start, next_distinct) if n >= 0})
         frames = torch.from_numpy(frames_thwc_u8).permute(0, 3, 1, 2)
@@ -227,7 +231,8 @@ def _register_features(
                 flow_clip_px=args.flow_clip_px,
                 extra_info={
                     "flow_noise_thresh_px": float(args.flow_noise_thresh_px),
-                    "flow_alignment": "flow[t]=frame[t]->next distinct frame; 0 in last run",
+                    "flow_alignment": "flow[t]=frame[t]->flow_gap-th next distinct frame; 0 in the last flow_gap runs",
+                    "flow_gap": int(args.flow_gap),
                     "flow_dup_thresh": float(args.dup_thresh),
                     "flow_fb_check": not args.no_fb_check,
                     "flow_fb_abs": float(args.fb_abs),
@@ -296,12 +301,9 @@ def _resolve_camera_streams(source_keys: list[str] | None, deshake_keys: list[st
     keys = source_keys or list(catalog)
     streams = []
     for key in keys:
-        if key not in catalog:
-            raise ValueError(
-                f"Unknown source key '{key}'. Known: {sorted(catalog)}. "
-                "Add a mapping in DEFAULT_CAMERA_STREAMS if needed."
-            )
-        stream = dict(catalog[key])
+        # Unknown keys (other robots, e.g. xhand ego/wrist/exo): <key>_depth / <key>_flow, no de-shake.
+        stream = dict(catalog.get(key) or {"source_key": key, "depth_key": f"{key}_depth",
+                                           "flow_key": f"{key}_flow", "deshake": False})
         if deshake_keys is not None:
             stream["deshake"] = key in deshake_keys
         streams.append(stream)
@@ -335,6 +337,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_DUP_THRESH,
         help="Mean |frame diff| (uint8) below which consecutive frames count as duplicates.",
+    )
+    p.add_argument(
+        "--flow-gap",
+        type=int,
+        default=1,
+        help="Flow from frame t to the N-th next distinct frame (1 = next frame). Larger for slow real-robot motion.",
     )
     p.add_argument("--no-fb-check", action="store_true", help="Disable forward-backward consistency masking.")
     p.add_argument("--fb-abs", type=float, default=DEFAULT_FB_ABS)
@@ -383,6 +391,7 @@ def main() -> None:
             fb_check=not args.no_fb_check,
             fb_abs=args.fb_abs,
             fb_rel=args.fb_rel,
+            flow_gap=args.flow_gap,
         )
         if compute_flow
         else None

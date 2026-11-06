@@ -1,0 +1,41 @@
+# @package _global_
+# Privileged MM teacher = MM + token stream embedding, plus the REAL clean D0 / F0 as inputs.
+#   sequence = [R0 | R_fut | D0 | D_fut | F0 | F_fut | A]
+#   mask     : R0->R0 ; R_fut->R0+R_fut ; D0->R0+D0 ; D_fut->R0+D0+D_fut (flow the same) ; A->all
+#   stream embedding (token) on every depth/flow token incl. D0/F0
+# Teacher for libero_joint_2cam224_1e-4_distill_mm_tok_priv. Training only: needs real D0/F0, so it
+# is never evaluated (eval_every: 0, infer raises).
+# Model code: src/fastwam/models/wan22/fastwam_joint_multimodal_priv.py
+
+defaults:
+  - override /data: libero_2cam_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal
+  - _self_
+
+data:
+  train:
+    rgb_condition_modalities: []   # keep the real D0 / F0 (default pastes RGB frame 0)
+
+batch_size: 8
+num_workers: 8
+gradient_accumulation_steps: 4
+
+model:
+  _target_: fastwam.runtime_distill.create_fastwam_joint_multimodal_priv
+  mot_checkpoint_mixed_attn: false
+  cross_stream_attention: none
+  stream_embedding: true
+  stream_embedding_mode: token
+
+EVALUATION:
+  compile_action_infer: false
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 10000
+eval_every: 0
+weight_decay: 1e-2
+resume: null

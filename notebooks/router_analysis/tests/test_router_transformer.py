@@ -1,7 +1,7 @@
 """Transformer router (``router_arch: transformer`` on ``router_input: embed`` in the _new model), CPU.
 
-  1. unit: logits [B, 3], uniform at init (zero-init head); padded text tokens do not change the
-     output; every parameter gets a gradient once the head is non-zero;
+  1. unit: logits [B, 3], uniform at init (zero-init head); all 128 text tokens are attended (no
+     padding mask, as the video expert); every parameter gets a gradient once the head is non-zero;
   2. real model: the task config builds TransformerModalityRouter with 98 R0 tokens; one real
      training_loss step runs; features are detached (no grad on patch_embedding, text_embedding,
      proprio_encoder); inference pick is the same for router_layout full / short;
@@ -30,10 +30,8 @@ RUN = "runs/libero_joint_2cam224_1e-4_random_full_all/2026-10-12_16-35-37"   # n
 def unit():
     torch.manual_seed(0)
     r = TransformerModalityRouter(dim=64, num_classes=3, num_r0_tokens=98, d=32)
-    mask = torch.ones(2, 128, dtype=torch.bool)
-    mask[:, 20:] = False
-    feats = {"r0": torch.randn(2, 98, 64), "text": torch.randn(2, 128, 64), "text_mask": mask,
-             "proprio": torch.randn(2, 64)}
+    feats = {"r0": torch.randn(2, 98, 64), "text": torch.randn(2, 128, 64),
+             "text_mask": torch.ones(2, 128, dtype=torch.bool), "proprio": torch.randn(2, 64)}
     out = r(feats)
     assert out.shape == (2, 3) and torch.equal(out, torch.zeros(2, 3)), out
     torch.nn.init.normal_(r.head[-1].weight)
@@ -42,12 +40,12 @@ def unit():
     feats2 = dict(feats, text=feats["text"].clone())
     feats2["text"][:, 20:] = torch.randn(2, 108, 64) * 100
     d = float((r(feats2) - a).abs().max())
-    assert d < 1e-5, d
+    assert d > 1e-3, d   # every text token is attended (no padding mask, as the video expert)
     r.train()
     r(feats).logsumexp(-1).sum().backward()
     missing = [n for n, p in r.named_parameters() if p.grad is None or float(p.grad.abs().sum()) == 0]
     assert not missing, missing
-    print(f"1. unit: logits (2, 3), uniform at init; pad tokens ignored (max diff {d:.1e}); "
+    print(f"1. unit: logits (2, 3), uniform at init; all 128 text tokens attended (trailing-token change -> diff {d:.1e}); "
           "all parameters get grad  OK")
 
 

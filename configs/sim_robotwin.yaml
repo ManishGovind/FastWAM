@@ -19,7 +19,7 @@ EVALUATION:
   task_name: null
   task_config: demo_randomized
   instruction_type: unseen
-  eval_num_episodes: 50
+  eval_num_episodes: 100
   output_dir: ./evaluate_results/robotwin/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
 
   # Action inference

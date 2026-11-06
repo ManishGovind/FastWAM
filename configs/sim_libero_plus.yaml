@@ -45,6 +45,8 @@ EVALUATION:
 
   # MultimodalSelect: leave unset / all = all futures; rgb|depth|flow = training-matched MoT
   # action_attend_mode: all
+  # Router models: eval-only inference layout (short | full); null = as trained. full + chosen == short.
+  router_layout: null
   # active_future: rgb
 
   # Optional external inputs
