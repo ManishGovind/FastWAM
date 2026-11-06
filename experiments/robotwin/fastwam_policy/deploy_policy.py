@@ -23,6 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from experiments.libero.eval_infer import ActionHistoryBuffer
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
@@ -180,6 +181,10 @@ class WorldActionRobotWinPolicy:
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
+        # router_action_history models: the executed (first replan_steps) normalized rows of each chunk,
+        # the last K, front-padded at the episode start (same as LIBERO). No-op for every other model.
+        self._history_cfg = OmegaConf.create({"EVALUATION": {"replan_steps": self.replan_steps}})
+        self.action_history = ActionHistoryBuffer(self.model, self._history_cfg)
         self.episode_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
@@ -254,6 +259,7 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        infer_kwargs.update(self.action_history.kwargs())   # {} unless router_action_history
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
@@ -261,6 +267,7 @@ class WorldActionRobotWinPolicy:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
         action_tensor = pred["action"]  # [T, D]
+        self.action_history.push(action_tensor)   # normalized, first replan_steps rows = the executed ones
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
         return action_chunk
 
@@ -306,6 +313,7 @@ class WorldActionRobotWinPolicy:
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        self.action_history = ActionHistoryBuffer(self.model, self._history_cfg)   # new episode: all pad
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()
