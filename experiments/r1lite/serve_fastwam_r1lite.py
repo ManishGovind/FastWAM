@@ -317,6 +317,9 @@ class FastWAMR1LitePolicy:
         self.model = instantiate(model_cfg, model_dtype=_model_dtype(args.mixed_precision), device=args.device)
         self.model.load_checkpoint(str(args.checkpoint))
         self.model = self.model.to(args.device).eval()
+        if args.router_layout:  # set after loading: cf models must be built with the full layout
+            self.model.router_layout = args.router_layout
+            print(f"[r1lite server] router_layout -> {self.model.router_layout}", flush=True)
         self.processor: FastWAMProcessor = instantiate(self.cfg.data.train.processor).eval()
         self.processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(args.dataset_stats)))
         self._validate_contract()
@@ -581,6 +584,8 @@ def parse_args() -> argparse.Namespace:
         "used for the router action history. Default: the full action horizon (client default)",
     )
     parser.add_argument("--tiled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--router-layout", choices=("short", "full"), default=None,
+                        help="Router models: inference layout (default: as trained)")
     parser.add_argument("--override", action="append", default=[], help="Repeat for each Hydra override")
     return parser.parse_args()
 
