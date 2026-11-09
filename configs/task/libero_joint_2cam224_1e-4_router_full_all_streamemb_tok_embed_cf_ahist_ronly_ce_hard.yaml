@@ -1,0 +1,59 @@
+# @package _global_
+# Router-loss ablation (router-only retrain): router_cf_loss = ce_hard.
+#   expected : sum_m pi(m) C^m                     (the method's objective; control under the same protocol)
+#   ce_hard  : -log pi(argmin_m C^m)               (CE on the lowest-cost stream)
+#   ce_soft  : CE to q = softmax(-C / T), T = 1    (C = relative action loss / batch std)
+# Same entropy (0.01) + balance (0.1) terms in every variant; only the cost term changes.
+# Experts FROZEN at libero_..._cf_ahist step 21700 (in cf the router never affects the experts: detached
+# inputs, action loss = mean over copies, sampled pick unused), router re-initialized, 5000 steps, no warm-up.
+# Init: checkpoints/router_ablation/cf_ahist_step021700_experts_only.pt (that checkpoint minus the router).
+
+defaults:
+  - override /data: libero_2cam_rgb_depth_flow
+  - override /model: fastwam_joint_multimodal_select_new
+  - _self_
+
+data:
+  train:
+    action_history_steps: 32
+
+batch_size: 8
+num_workers: 8
+gradient_accumulation_steps: 4
+
+train_router_only: true
+resume: checkpoints/router_ablation/cf_ahist_step021700_experts_only.pt
+
+model:
+  mot_checkpoint_mixed_attn: false
+  enabled_video_streams: [rgb, depth, flow]
+  modality_select: router
+  stream_router_temperature: 1.0
+  router_entropy_coef: 0.0   # CE ablation: pure cross-entropy (no entropy bonus)
+  router_collapse_kl: 0.0    # CE ablation: no balance KL
+  router_warmup_steps: 0
+  router_reward: counterfactual
+  router_cf_loss: ce_hard
+  router_cf_soft_temp: 1.0
+  router_baseline: timestep_ema
+  router_adv_normalize: true
+  router_video_size: ${data.train.video_size}
+  router_layout: full
+  router_video_loss: all
+  modality_prompt: false
+  stream_embedding: true
+  stream_embedding_mode: token
+  router_input: embed
+  router_action_history: true
+
+EVALUATION:
+  compile_action_infer: false
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: 5000
+log_every: 10
+save_every: 5000
+eval_every: 0
+weight_decay: 1e-2
