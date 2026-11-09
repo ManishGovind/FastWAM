@@ -110,6 +110,13 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         router_baseline_bins = int(kwargs.pop("router_baseline_bins", 10))
         router_baseline_momentum = float(kwargs.pop("router_baseline_momentum", 0.99))
         router_adv_normalize = bool(kwargs.pop("router_adv_normalize", True))
+        # Counterfactual router objective (ablation): expected = sum_m pi(m) C^m (default);
+        # ce_hard = -log pi(argmin_m C^m); ce_soft = CE to q = softmax(-C / router_cf_soft_temp).
+        router_cf_loss = str(kwargs.pop("router_cf_loss", "expected")).lower()
+        router_cf_soft_temp = float(kwargs.pop("router_cf_soft_temp", 1.0))
+        if router_cf_loss not in ("expected", "ce_hard", "ce_soft") or router_cf_soft_temp <= 0:
+            raise ValueError(f"router_cf_loss must be expected|ce_hard|ce_soft and router_cf_soft_temp > 0, "
+                             f"got {router_cf_loss!r}, {router_cf_soft_temp}")
         router_warmup_steps = int(kwargs.pop("router_warmup_steps", 0))
         router_grad_accum = int(kwargs.pop("router_grad_accum", 1))
         router_layout = str(kwargs.pop("router_layout", "short")).lower()
@@ -183,6 +190,8 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         model.router_baseline_bins = router_baseline_bins
         model.router_baseline_momentum = router_baseline_momentum
         model.router_adv_normalize = router_adv_normalize
+        model.router_cf_loss = router_cf_loss
+        model.router_cf_soft_temp = router_cf_soft_temp
         model.router_warmup_steps = router_warmup_steps
         model.router_grad_accum = router_grad_accum
         # training_loss calls with the router in train mode (micro-batches).
@@ -1618,15 +1627,24 @@ class FastWAMJointMultimodalSelectNew(FastWAMJointMultimodal):
         if counterfactual:
             # Per sample and stream: the action loss when the action reads that stream (same weights as loss_total).
             cf = (self.loss_lambda_action * action_loss_per_copy * action_weight.float().reshape(-1, 1)).detach()   # [B, K]; weight is [B] or scalar (eval)
+            self._last_cf_cost = cf   # per-sample, per-stream cost; read by scripts/router_offline_extract.py
             advantage = cf - cf.mean(dim=1, keepdim=True)            # relative to the other streams, same sample
             if self.router_adv_normalize and advantage.numel() > 1:
                 advantage = advantage / advantage.std().clamp_min(1e-6)
             probs_ps = router_log_probs.exp()
             cf_loss = (probs_ps * advantage).sum(dim=-1).mean()       # gradient: each stream by its own loss
+            cf_mode = getattr(self, "router_cf_loss", "expected")
+            if cf_mode == "ce_hard":     # ablation: CE on the lowest-cost stream
+                cf_obj = F.nll_loss(router_log_probs, advantage.argmin(dim=1))
+            elif cf_mode == "ce_soft":   # ablation: CE to softmax(-C / T)
+                target = torch.softmax(-advantage / float(self.router_cf_soft_temp), dim=-1)
+                cf_obj = -(target * router_log_probs).sum(dim=-1).mean()
+            else:
+                cf_obj = cf_loss
             entropy = -(probs_ps * router_log_probs).sum(dim=-1).mean()
             collapse = collapse_kl(router_logits)
             router_loss = (
-                cf_loss
+                cf_obj
                 - float(self.router_entropy_coef) * entropy
                 + float(self.router_collapse_kl) * collapse
             )

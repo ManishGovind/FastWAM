@@ -81,14 +81,22 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
+        # train_router_only (ablation): DiT + proprio encoder frozen (still in train mode), only the router trains.
+        self.model.train_router_only = bool(cfg.get("train_router_only", False))
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
         modality_router = getattr(self.model, "modality_router", None)
-        if modality_router is not None:
-            trainable_params.extend(list(modality_router.parameters()))
+        if self.model.train_router_only:
+            if modality_router is None:
+                raise ValueError("`train_router_only: true` needs a model with a modality_router.")
+            trainable_params = list(modality_router.parameters())
+            logger.info("train_router_only: optimizing %d router parameters only.", sum(p.numel() for p in trainable_params))
+        else:
+            trainable_params = list(self.model.dit.parameters())
+            proprio_encoder = getattr(self.model, "proprio_encoder", None)
+            if proprio_encoder is not None:
+                trainable_params.extend(list(proprio_encoder.parameters()))
+            if modality_router is not None:
+                trainable_params.extend(list(modality_router.parameters()))
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -327,6 +335,10 @@ class Wan22Trainer:
         if modality_router is not None:
             modality_router.train()
             modality_router.requires_grad_(True)
+        if getattr(model, "train_router_only", False):
+            model.dit.requires_grad_(False)
+            if proprio_encoder is not None:
+                proprio_encoder.requires_grad_(False)
 
     @staticmethod
     def _batch_optional_tensor(tensor, *, name: str, batch_ndim: int) -> torch.Tensor:

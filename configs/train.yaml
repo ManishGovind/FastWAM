@@ -30,6 +30,8 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+# Ablation: freeze DiT + proprio encoder, train only model.modality_router (init from `resume`).
+train_router_only: false
 
 # wandb
 wandb:

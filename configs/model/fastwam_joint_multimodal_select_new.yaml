@@ -82,6 +82,10 @@ router_baseline: batch
 router_baseline_bins: 10
 router_baseline_momentum: 0.99
 router_adv_normalize: true
+# router_reward: counterfactual only -- router objective (ablation): expected (sum_m pi(m) C^m) |
+# ce_hard (CE on argmin_m C^m) | ce_soft (CE to softmax(-C / router_cf_soft_temp))
+router_cf_loss: expected
+router_cf_soft_temp: 1.0
 # Router warm-up (optimizer steps): uniform random routing, router frozen (loss x0).
 # 0 = off. router_grad_accum converts training_loss calls to optimizer steps.
 router_warmup_steps: 0
