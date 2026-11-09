@@ -33,6 +33,9 @@ EVALUATION:
   tiled: false
   timing_enabled: false
   skip_get_obs_within_replan: true
+  # Router models: inference layout (short | full). null = as trained.
+  router_layout: null
+
 
   # Runtime inputs
   dataset_stats_path: null

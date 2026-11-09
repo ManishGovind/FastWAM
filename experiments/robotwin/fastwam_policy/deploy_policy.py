@@ -156,6 +156,7 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        router_layout: Optional[str] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -163,6 +164,11 @@ class WorldActionRobotWinPolicy:
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
+        # Eval-only inference layout for router models (same as LIBERO). None = as trained.
+        if router_layout:
+            self.model.router_layout = str(router_layout).lower()
+            # print: this module's logger is not shown in RoboTwin's process (only fastwam.* loggers are)
+            print(f"[fastwam_policy] EVALUATION.router_layout -> {self.model.router_layout}", flush=True)
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -377,6 +383,10 @@ def get_model(usr_args: Dict[str, Any]):
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
 
+    router_layout = usr_args.get("router_layout")
+    if _is_none_like(router_layout):
+        router_layout = cfg.EVALUATION.get("router_layout")
+
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
         processor_cfg=cfg.data.train.processor,
@@ -395,6 +405,7 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        router_layout=None if _is_none_like(router_layout) else str(router_layout),
     )
     return policy
 
