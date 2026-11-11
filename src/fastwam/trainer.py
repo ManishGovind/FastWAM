@@ -507,8 +507,13 @@ class Wan22Trainer:
             infer_kwargs["prompt"] = prompt
         # Models that condition on extra text (e.g. the _new select modality condition) need
         # the instruction string even when only the cached context is passed.
-        if "prompt_text" in inspect.signature(model.infer).parameters:
+        infer_params = inspect.signature(model.infer).parameters
+        if "prompt_text" in infer_params:
             infer_kwargs["prompt_text"] = prompt
+        # Privileged teacher: the real first frame of each aux stream (only models that accept input_<name>).
+        for name in ("depth", "flow"):
+            if f"input_{name}" in infer_params and sample.get(f"video_{name}") is not None:
+                infer_kwargs[f"input_{name}"] = sample[f"video_{name}"][0][:, 0].unsqueeze(0)
 
         pred = model.infer(
             **infer_kwargs,

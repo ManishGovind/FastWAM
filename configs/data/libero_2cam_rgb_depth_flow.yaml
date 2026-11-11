@@ -1,10 +1,11 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_multimodal_video_dataset.RobotMultimodalVideoDataset
   dataset_dirs:
-    - /net/labs/sdas24_lab/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
-    - /net/labs/sdas24_lab/libero_mujoco3.3.2/libero_object_no_noops_lerobot
-    - /net/labs/sdas24_lab/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
-    - /net/labs/sdas24_lab/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+    # local copy of /net/labs/sdas24_lab/libero_mujoco3.3.2 (same episodes / frames; /net Quobyte was slow 2026-11-11)
+    - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
   shape_meta:
     images:
       # Order must match modality_camera_groups indices below. No future_key splice.

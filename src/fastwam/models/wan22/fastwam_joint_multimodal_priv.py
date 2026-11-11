@@ -8,7 +8,8 @@ Token stream embedding (if on) goes on every depth/flow token incl. D0/F0 (R0 un
 otherwise D0/F0 share R0's RoPE positions and are indistinguishable.
 
 The data must keep the real D0/F0: data.train.rgb_condition_modalities: [].
-Training only (teacher for distillation, never evaluated): inference raises.
+Teacher for distillation; no sim eval (F0 = flow t->t+1 does not exist at decision time). infer() works only
+with the real first frames (Trainer.evaluate on dataset clips passes input_depth / input_flow).
 Loss / noise / timesteps: FastWAMJointMultimodal.training_loss (frame 0 is never a target).
 """
 
@@ -97,7 +98,32 @@ class FastWAMJointMultimodalPriv(FastWAMJointMultimodal):
             off += length
         return pred_video, self.action_expert.post(action_out)
 
-    def infer(self, *args, **kwargs):
-        raise NotImplementedError("Privileged teacher (needs real D0/F0) is training-only.")
+    # ---- inference: only for Trainer.evaluate on dataset clips (the real D0/F0 exist there, not in the sim)
+    @torch.no_grad()
+    def infer(self, *args, input_depth: Optional[torch.Tensor] = None, input_flow: Optional[torch.Tensor] = None,
+              **kwargs):
+        """MM infer with each stream's frame 0 = its own real first frame (input_depth / input_flow: [1,3,H,W])."""
+        frames = {"depth": input_depth, "flow": input_flow}
+        missing = [n for n in self._enabled_streams() if n != "rgb" and frames.get(n) is None]
+        if missing:
+            raise ValueError(f"Privileged teacher infer needs the real first frame of {missing} (input_<name>)")
+        object.__setattr__(self, "_priv_frame0", frames)
+        try:
+            return super().infer(*args, **kwargs)
+        finally:
+            object.__setattr__(self, "_priv_frame0", None)
 
-    infer_action = infer_joint = infer
+    def _init_multistream_infer_latents(self, *, input_image, tiled, **kwargs):
+        frames = getattr(self, "_priv_frame0", None)
+        if frames is None:  # infer_action / infer_joint called directly (e.g. sim eval): no real D0/F0
+            raise NotImplementedError("Privileged teacher needs real D0/F0: only infer(input_depth=, input_flow=).")
+        latents_video, latents_action, first_frames, fuse_flag = super()._init_multistream_infer_latents(
+            input_image=input_image, tiled=tiled, **kwargs)
+        for name in latents_video:
+            if name == "rgb":
+                continue
+            z0 = self._encode_input_image_latents_tensor(
+                input_image=frames[name].to(device=self.device, dtype=self.torch_dtype), tiled=tiled)
+            latents_video[name][:, :, 0:1] = z0
+            first_frames[name] = z0.clone()
+        return latents_video, latents_action, first_frames, fuse_flag

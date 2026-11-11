@@ -3,8 +3,8 @@
 #   sequence = [R0 | R_fut | D0 | D_fut | F0 | F_fut | A]
 #   mask     : R0->R0 ; R_fut->R0+R_fut ; D0->R0+D0 ; D_fut->R0+D0+D_fut (flow the same) ; A->all
 #   stream embedding (token) on every depth/flow token incl. D0/F0
-# Teacher for libero_joint_2cam224_1e-4_distill_mm_tok_priv. Training only: needs real D0/F0, so it
-# is never evaluated (eval_every: 0, infer raises).
+# Teacher for libero_joint_2cam224_1e-4_distill_mm_tok_priv_feat. Training only: needs real D0/F0, so it
+# has no sim eval (F0 = flow t->t+1); Trainer.evaluate on a dataset clip (real D0/F0) logs videos every eval_every.
 # Model code: src/fastwam/models/wan22/fastwam_joint_multimodal_priv.py
 
 defaults:
@@ -36,6 +36,6 @@ num_epochs: 10
 max_steps: null
 log_every: 10
 save_every: 10000
-eval_every: 0
+eval_every: 10   # TEMP check that eval videos save; set back to 5000 for the real run. Trainer.evaluate on a dataset clip (real D0/F0 from the data); no sim eval
 weight_decay: 1e-2
 resume: null
