@@ -17,12 +17,17 @@ def create_fastwam_joint_multimodal_priv(**kwargs):
     return model
 
 
-def create_fastwam_joint_distill(teacher_run: str, teacher_step: int = 21700, **kwargs):
-    """FastWAMJointDistill: RGB FastWAMJoint student + frozen teacher from ``teacher_run`` @ ``teacher_step``."""
+def create_fastwam_joint_distill(teacher_run: str, teacher_step: int = 21700, distill_feature_weight: float = 0.0,
+                                 distill_action_target: str = "teacher", **kwargs):
+    """FastWAMJointDistill: RGB FastWAMJoint student + frozen teacher from ``teacher_run`` @ ``teacher_step``.
+
+    ``distill_action_target``: 'gt' = the RGB baseline's action loss, 'teacher' = regress the teacher's velocity.
+    ``distill_feature_weight`` > 0 adds last-layer action-hidden-state (feature) distillation.
+    """
     from .models.wan22.fastwam_joint_distill import FastWAMJointDistill
     from .runtime import create_fastwam_joint
 
     model = create_fastwam_joint(**kwargs)
     model.__class__ = FastWAMJointDistill
-    model.setup_distill(teacher_run, teacher_step)
+    model.setup_distill(teacher_run, teacher_step, distill_feature_weight, distill_action_target)
     return model
