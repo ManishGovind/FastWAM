@@ -288,3 +288,6 @@ notebooks/router_analysis/outputs/*
 
 # xArm7 collected demos and rollouts
 /experiments/xarm7/data/
+
+# pi-WAM xArm7 rollouts
+/experiments/xarm7_piwam/data/
