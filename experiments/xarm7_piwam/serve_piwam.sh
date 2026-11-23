@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # pi-WAM (router) policy server on 127.0.0.1:8780, code from the origin/dev worktree.
-#   ./serve_piwam.sh [--checkpoint step_030000.pt] [--active-future rgb|depth|flow|random]
+#   ./serve_piwam.sh [--checkpoint step_030000.pt] [--active-future rgb|depth|flow|random] [--router-layout short|full]
 # One-time setup: git -C ~/workspace/FastWAM worktree add --detach ~/workspace/FastWAM_dev origin/dev
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

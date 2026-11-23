@@ -182,6 +182,13 @@ class PiWAMXArm7Policy:
             torch.set_default_dtype(prev_dtype)
         self.step = self._load_checkpoint(bundle / args.checkpoint)
         self.model = self.model.to(args.device).eval()
+        # Override only after building: counterfactual-router models must be built with the
+        # full layout (as the R1 Lite server on origin/real-world-mm does).
+        self.trained_router_layout = str(getattr(self.model, "router_layout", "short"))
+        if args.router_layout:
+            self.model.router_layout = args.router_layout
+        self.router_layout = str(getattr(self.model, "router_layout", "short"))
+        LOGGER.info("router_layout=%s (trained: %s)", self.router_layout, self.trained_router_layout)
 
         self.enabled_streams = tuple(self.model._enabled_streams())
         self.history = None
@@ -297,6 +304,7 @@ class PiWAMXArm7Policy:
             "active_future": active_future,
             "router_probs": probs,
             "history_len": history_len,
+            "router_layout": self.router_layout,
         }
 
 
@@ -313,6 +321,8 @@ def build_app(policy: PiWAMXArm7Policy) -> FastAPI:
             "cached_prompts": policy.num_cached_prompts,
             "enabled_streams": list(policy.enabled_streams),
             "active_future": policy.active_future or "router",
+            "router_layout": policy.router_layout,
+            "trained_router_layout": policy.trained_router_layout,
             "action_history_k": policy.history.k if policy.history else 0,
             "replan_steps": policy.history.replan if policy.history else None,
         }
@@ -332,6 +342,7 @@ def build_app(policy: PiWAMXArm7Policy) -> FastAPI:
             "active_future": result["active_future"],
             "router_probs": result["router_probs"],
             "history_len": result["history_len"],
+            "router_layout": result["router_layout"],
             "server_timing": {"infer_ms": (time.perf_counter() - started) * 1000.0},
         }
 
@@ -354,6 +365,10 @@ def parse_args() -> argparse.Namespace:
                              "these rows feed the router action history")
     parser.add_argument("--active-future", choices=["router", "rgb", "depth", "flow", "random"], default="router",
                         help="router (default) = learned per-chunk choice; others force/randomize the stream")
+    parser.add_argument("--router-layout", choices=("short", "full"), default=None,
+                        help="Inference layout (default: as trained, i.e. full for this bundle). full = all three "
+                             "futures in the MoT, only the chosen one denoised; short = only the chosen future "
+                             "(same action up to numerics, ~3x fewer video tokens, faster)")
     return parser.parse_args()
 
 
@@ -365,8 +380,9 @@ def main() -> None:
         raise SystemExit(f"fastwam imported from {fastwam.__file__}, not --code-root {args.code_root}")
     policy = PiWAMXArm7Policy(args)
     LOGGER.info(
-        "Serving step %s on %s:%d (action_horizon=%d, streams=%s, history K=%s, replan=%s, %d cached prompts)",
-        policy.step, args.host, args.port, policy.action_horizon, policy.enabled_streams,
+        "Serving step %s on %s:%d (action_horizon=%d, streams=%s, router_layout=%s, history K=%s, replan=%s, "
+        "%d cached prompts)",
+        policy.step, args.host, args.port, policy.action_horizon, policy.enabled_streams, policy.router_layout,
         policy.history.k if policy.history else 0, args.replan_steps, policy.num_cached_prompts,
     )
     uvicorn.run(build_app(policy), host=args.host, port=args.port)

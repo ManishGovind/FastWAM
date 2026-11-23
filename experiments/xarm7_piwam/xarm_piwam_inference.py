@@ -626,7 +626,9 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
         server_endpoint=None, keys=None):
     """Run live inference until the operator presses Enter (stop) or d (discard).
 
-    Returns (..., step_count, stop_reason) with stop_reason "stop" or "discard".
+    Returns (..., step_count, stop_reason, chunk_latencies) with stop_reason
+    "stop" or "discard" and chunk_latencies the per-chunk server round-trip
+    times in seconds.
     """
     stop_reason = "stop"
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
@@ -642,6 +644,7 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
     debug_saved = False
     query_idx = 0
     step_count = 0
+    chunk_latencies = []  # seconds per server round trip (encode excluded)
     # Router bookkeeping: one entry per chunk (= per server query).
     episode_id = f"{DATE_TIME}-{uuid.uuid4().hex[:8]}"
     chunk_id = 0
@@ -711,7 +714,11 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
                     "episode_id": episode_id,
                     "chunk_id": chunk_id + 1,
                 }
+                t_query = time.perf_counter()
                 out = get_action_from_piwam(obs_snapshot, server_endpoint)
+                latency = time.perf_counter() - t_query
+                chunk_latencies.append(latency)
+                log_message(f"[latency] chunk {len(chunk_latencies)}: {latency * 1000:.1f} ms", log_file)
                 chunk_id += 1
                 acts = out["actions"]
                 probs = out.get("router_probs") or {}
@@ -764,6 +771,14 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
     except KeyboardInterrupt:
         log_message("[episode] stopped inference loop", log_file)
 
+    if chunk_latencies:
+        log_message(
+            f"[latency] episode: {len(chunk_latencies)} chunks, "
+            f"avg {np.mean(chunk_latencies) * 1000:.1f} ms "
+            f"(min {np.min(chunk_latencies) * 1000:.1f}, max {np.max(chunk_latencies) * 1000:.1f})",
+            log_file,
+        )
+
     collected_data = None
     if cfg.data_collection and primary_images_list:
         collected_data = {
@@ -777,6 +792,7 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
             "proprio": np.stack(proprio_list, axis=0),
             "actions": np.stack(actions_list, axis=0) if actions_list else np.zeros((0, 7), dtype=np.float32),
             "success": False,
+            "chunk_latency_s": np.asarray(chunk_latencies, dtype=np.float64),
             "router_modality": np.array(router_modality, dtype="S8"),
             "router_probs": (np.array(router_probs, dtype=np.float32) if router_streams
                              else np.full((len(router_modality), 0), np.nan, dtype=np.float32)),
@@ -798,7 +814,7 @@ def run(cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
                 collected_data["future_wrist_images"] = np.stack(future_wrist_images, axis=0)
 
     return (rollout_primary_images, rollout_wrist_images, future_image_predictions_list,
-            collected_data, step_count, stop_reason)
+            collected_data, step_count, stop_reason, chunk_latencies)
 
 
 def _model_tag(ckpt_path):
@@ -1192,7 +1208,7 @@ def main():
                 log_message("[run] starting live inference", log_file)
                 (rollout_primary_images, rollout_wrist_images,
                  future_image_predictions_list, collected_data, step_count,
-                 stop_reason) = run(
+                 stop_reason, chunk_latencies) = run(
                     cfg, model, dataset_stats, arm, primary_cap, wrist_cap, ego_cap, task,
                     save_debug_image=save_debug_image,
                     debug_image_dir=os.path.join(deploy_dir, "rollouts"),
@@ -1235,7 +1251,10 @@ def main():
                     score=score,
                 )
                 records.append({"trial": trial_name, "score": score, "test_dir": test_dir,
-                                "obs_dir": obs_dir, "h5_path": h5_path})
+                                "obs_dir": obs_dir, "h5_path": h5_path,
+                                "chunk_latencies": list(chunk_latencies),
+                                "avg_latency": (float(np.mean(chunk_latencies))
+                                                if chunk_latencies else None)})
                 log_message(f"[run] saved {trial_name} score={score} to {test_dir}", log_file)
                 print(f"Saved {trial_name}: score {score}/{MAX_TRIAL_SCORE} ({SCORE_LEVELS[score]}); "
                       f"running {sum(r['score'] for r in records)}/{MAX_TRIAL_SCORE * len(records)}. "
@@ -1269,9 +1288,28 @@ def main():
         print("\n" + "=" * len(summary))
         print(summary)
         for r in records:
-            print(f"    {r['trial']}: score={r['score']}/{MAX_TRIAL_SCORE} ({SCORE_LEVELS[r['score']]})")
+            lat = (f", avg latency {r['avg_latency'] * 1000:.1f} ms over {len(r['chunk_latencies'])} chunks"
+                   if r["avg_latency"] is not None else "")
+            print(f"    {r['trial']}: score={r['score']}/{MAX_TRIAL_SCORE} ({SCORE_LEVELS[r['score']]}){lat}")
+        demo_avgs = [r["avg_latency"] for r in records if r["avg_latency"] is not None]
+        all_chunks = [x for r in records for x in r["chunk_latencies"]]
+        latency_summary = None
+        if demo_avgs:
+            latency_summary = (
+                f"[run] latency: mean of per-demo averages {np.mean(demo_avgs) * 1000:.1f} ms "
+                f"({len(demo_avgs)} demos); mean over all chunks {np.mean(all_chunks) * 1000:.1f} ms "
+                f"({len(all_chunks)} chunks, min {np.min(all_chunks) * 1000:.1f}, "
+                f"max {np.max(all_chunks) * 1000:.1f})"
+            )
+            print(latency_summary)
         print("=" * len(summary))
         log_message(summary, log_file)
+        for r in records:
+            if r["avg_latency"] is not None:
+                log_message(f"[run] {r['trial']} avg latency {r['avg_latency'] * 1000:.1f} ms "
+                            f"({len(r['chunk_latencies'])} chunks)", log_file)
+        if latency_summary:
+            log_message(latency_summary, log_file)
 
     log_message(
         f"[run] finished — {run_dir}",
